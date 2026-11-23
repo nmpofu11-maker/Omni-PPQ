@@ -1,0 +1,6 @@
+{
+  "name": "OmniPulse Quant",
+  "description": "Real-time multi-sport quantitative live betting prediction & Best-Bet advisor covering Soccer, Basketball, American Football, Ice Hockey, Baseball, and Tennis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
