@@ -89,7 +89,26 @@ export function decimalToImpliedProb(decimalOdds: number): number {
   return clamp(1 / decimalOdds, 0.001, 0.999);
 }
 
-export function probToDecimalOdds(prob: number): number {
+export function probToDecimalOdds(prob: number, pushProb = 0): number {
   const safe = clamp(prob, 0.01, 0.99);
-  return Math.round((1 / safe) * 100) / 100;
+  const push = clamp(pushProb, 0, 0.98);
+  // Fair decimal odds when a push returns the stake: (1 - push) / winProb.
+  const payout = Math.max(0.01, 1 - push);
+  return Math.round((payout / safe) * 100) / 100;
+}
+
+/**
+ * Exact Kelly fraction for win/loss/push markets. A push returns the stake,
+ * so it contributes zero net profit and is already excluded from both legs.
+ */
+export function kellyFraction(
+  winProb: number,
+  lossProb: number,
+  decimalOdds: number
+): number {
+  if (!Number.isFinite(decimalOdds) || decimalOdds <= 1.01) return 0;
+  const b = decimalOdds - 1;
+  const ev = winProb * b - lossProb;
+  if (ev <= 0) return 0;
+  return clamp(ev / b, 0, 1);
 }

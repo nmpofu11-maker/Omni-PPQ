@@ -1,6 +1,8 @@
 /**
  * Plays a clean, subtle Web Audio API quant chime without external audio asset dependencies.
  */
+import { mutationHeaders } from './api';
+
 export function playQuantChime(): void {
   try {
     const AudioCtx =
@@ -91,7 +93,7 @@ export async function enableBrowserAndPushAlerts(): Promise<{
           }
           await fetch('/api/push/subscribe', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: mutationHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(sub.toJSON()),
           });
           pushSubscribed = true;

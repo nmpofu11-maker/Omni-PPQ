@@ -15,6 +15,15 @@ export type DataQualityTier =
   | 'live_boxscore'
   | 'record_prior';
 
+export type PriceKind = 'live' | 'prematch' | 'closing' | 'unknown';
+
+export interface OddsVerification {
+  verified: boolean;
+  isLiveVerified: boolean;
+  reasons: string[];
+  ageSec?: number;
+}
+
 export type MarketCategory =
   | 'Moneyline (2-Way)'
   | 'Point Spread'
@@ -30,7 +39,11 @@ export interface PlayEvent {
   id: string;
   clock: string;
   period: number;
-  elapsedPct: number;
+  /** Fraction of regulation elapsed, derived only from a real source clock. */
+  elapsedPct?: number;
+  /** Absolute elapsed match minutes, derived only from a real source clock. */
+  elapsedMinutes?: number;
+  clockSource?: 'scoreboard_clock' | 'period_only' | 'unknown';
   team: 'home' | 'away' | 'neutral';
   type: string;
   text: string;
@@ -108,6 +121,12 @@ export interface MarketOdds {
   overOdds?: number;
   underOdds?: number;
   provider?: string;
+  /** Provenance of the prices above; required for any recommendation. */
+  priceKind?: PriceKind;
+  source?: string;
+  capturedAt?: string;
+  marketId?: string;
+  verification?: OddsVerification;
   isLiveVerified: boolean;
   lastUpdated?: string;
 }
@@ -157,6 +176,9 @@ export interface PureFlowPrediction {
   matchId: string;
   sport: SportType;
   dataQuality: DataQualityTier;
+  modelVersion: string;
+  parameterVersion: string;
+  evidence: EvidenceSummary;
   progressPct: number;
   fairProbs: {
     homeWin: number;
@@ -213,8 +235,20 @@ export interface PureFlowPrediction {
     homeMomentum: number;
     awayMomentum: number;
   }>;
+  /** Extra expected goals awarded after regulation (OT, extra innings). */
+  expectedAdditionalGoals?: number;
   confidence: number;
   modelNotes: string[];
+}
+
+export interface EvidenceSummary {
+  tier: DataQualityTier;
+  homeBox: 'complete' | 'partial' | 'none';
+  awayBox: 'complete' | 'partial' | 'none';
+  playsTimed: number;
+  playsTotal: number;
+  identityValid: boolean;
+  notes: string[];
 }
 
 export interface ValueAlert {
@@ -234,16 +268,29 @@ export interface ValueAlert {
   line?: number;
   fairProb: number;
   fairOdds: number;
+  /** Probability the selection loses / pushes, used for EV and scoring. */
+  lossProb: number;
+  pushProb: number;
   bookmakerOdds: number;
   impliedProb: number;
   evPct: number;
   kellyQuarterStakePct: number;
   oddsVerifiedLive: boolean;
   oddsLabel: 'Verified Live' | 'Pre-Match / Closing';
+  priceVerified: boolean;
+  priceKind: PriceKind;
+  priceSource?: string;
+  priceCapturedAt?: string;
   provider?: string;
   dataQuality: DataQualityTier;
   progressPct: number;
+  // Separated score components (never conflated into one opaque number).
+  modelProbability: number;
+  dataQualityScore: number;
+  uncertaintyScore: number;
+  calibrationScore: number;
   convictionScore: number;
+  rankingScore: number;
 }
 
 export interface PaperBet {

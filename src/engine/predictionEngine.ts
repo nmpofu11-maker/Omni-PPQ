@@ -1,10 +1,7 @@
 import {
-  DataQualityTier,
   OddsFreeMatchSnapshot,
-  PlayEvent,
   PureFlowPrediction,
   ScrapedMatch,
-  TeamTelemetry,
 } from '../types/quant';
 import {
   clamp,
@@ -12,6 +9,19 @@ import {
   parseRecordWinPct,
   poissonPmf,
 } from './mathUtils';
+import { assessEvidence, evidenceConfidence } from './evidence';
+import { buildMomentumSeries, computeRecencyFlowScore } from './momentum';
+import {
+  MODEL_VERSION,
+  type BaseballModelParams,
+  type BasketballModelParams,
+  type FootballModelParams,
+  type HockeyModelParams,
+  type ModelParameterOverrides,
+  type SoccerModelParams,
+  type TennisModelParams,
+  resolveModelParams,
+} from './modelParams';
 
 /**
  * STAGE 1 ODDS FIREWALL:
@@ -52,73 +62,6 @@ export function stripOddsForFirewall(
   };
 }
 
-function buildMomentumSeries(
-  plays: PlayEvent[],
-  progressPct: number,
-  homeBase: number,
-  awayBase: number
-): PureFlowPrediction['momentumSeries'] {
-  const buckets = 8;
-  const maxPct = Math.max(0.1, progressPct);
-  const series: PureFlowPrediction['momentumSeries'] = [];
-
-  for (let i = 1; i <= buckets; i++) {
-    const bucketEnd = (i / buckets) * maxPct;
-    const bucketStart = ((i - 1) / buckets) * maxPct;
-    let homeSignal = 0;
-    let awaySignal = 0;
-
-    for (const play of plays) {
-      if (play.elapsedPct >= bucketStart && play.elapsedPct <= bucketEnd) {
-        if (play.team === 'home') homeSignal += play.weight;
-        else if (play.team === 'away') awaySignal += play.weight;
-      }
-    }
-
-    const total = homeSignal + awaySignal;
-    const homeMomentum =
-      total > 0
-        ? clamp(0.25 + 0.75 * (homeSignal / total), 0.1, 0.95)
-        : clamp(homeBase / Math.max(0.1, homeBase + awayBase), 0.2, 0.8);
-    const awayMomentum = clamp(1 - homeMomentum, 0.05, 0.9);
-
-    series.push({
-      pct: Math.round(bucketEnd * 100),
-      label: `${Math.round(bucketEnd * 100)}%`,
-      homeMomentum: Math.round(homeMomentum * 100) / 100,
-      awayMomentum: Math.round(awayMomentum * 100) / 100,
-    });
-  }
-
-  return series;
-}
-
-function computeRecencyFlowScore(
-  plays: PlayEvent[],
-  currentPct: number,
-  scaleMinutes: number,
-  decayRate = 0.08
-): { homeFlow: number; awayFlow: number; count: number } {
-  let homeFlow = 0;
-  let awayFlow = 0;
-  let count = 0;
-
-  for (const p of plays) {
-    const deltaPct = Math.max(0, currentPct - p.elapsedPct);
-    const deltaMin = deltaPct * scaleMinutes;
-    const recencyWeight = Math.exp(-decayRate * deltaMin);
-    const w = Math.max(0.1, p.weight) * recencyWeight;
-    if (p.team === 'home') {
-      homeFlow += w;
-      count++;
-    } else if (p.team === 'away') {
-      awayFlow += w;
-      count++;
-    }
-  }
-  return { homeFlow, awayFlow, count };
-}
-
 function getRecordAdvantage(homeRecord?: string, awayRecord?: string): {
   homeStrength: number; // centered around 0.5
   awayStrength: number;
@@ -140,41 +83,33 @@ function getRecordAdvantage(homeRecord?: string, awayRecord?: string): {
   };
 }
 
-function hasLiveBoxscoreMetrics(stats: TeamTelemetry): boolean {
-  return Boolean(
-    stats.shots !== undefined ||
-      stats.shotsOnTarget !== undefined ||
-      stats.fieldGoalPct !== undefined ||
-      stats.totalYards !== undefined ||
-      stats.baseballHits !== undefined ||
-      stats.powerPlayPct !== undefined ||
-      stats.hits !== undefined ||
-      stats.aces !== undefined ||
-      (stats.linescores && stats.linescores.length > 0)
-  );
-}
-
-export function inferDataQuality(snapshot: OddsFreeMatchSnapshot): DataQualityTier {
-  const hasPlays = snapshot.plays && snapshot.plays.length > 0;
-  const hasBox =
-    hasLiveBoxscoreMetrics(snapshot.homeStats) ||
-    hasLiveBoxscoreMetrics(snapshot.awayStats);
-
-  if (hasPlays && hasBox) return 'play_by_play_boxscore';
-  if (hasBox || (snapshot.status === 'live' && snapshot.progressPct > 0.05)) {
-    return 'live_boxscore';
-  }
-  return 'record_prior';
-}
-
 // ---------------- POISSON GRID HELPERS ----------------
+
+/**
+ * Dixon-Coles tau: independent Poisson underestimates 0-0/1-1 draws and
+ * overestimates 1-0/0-1. rho is typically small and negative.
+ */
+export function dixonColesTau(
+  homeGoals: number,
+  awayGoals: number,
+  lambdaHome: number,
+  lambdaAway: number,
+  rho: number
+): number {
+  if (homeGoals === 0 && awayGoals === 0) return 1 - lambdaHome * lambdaAway * rho;
+  if (homeGoals === 1 && awayGoals === 0) return 1 + lambdaAway * rho;
+  if (homeGoals === 0 && awayGoals === 1) return 1 + lambdaHome * rho;
+  if (homeGoals === 1 && awayGoals === 1) return 1 - rho;
+  return 1;
+}
 
 function computePoissonMatrixOutcomes(
   currentHome: number,
   currentAway: number,
   lambdaHomeRem: number,
   lambdaAwayRem: number,
-  maxGoals = 12
+  maxGoals = 12,
+  rho = 0
 ) {
   let homeWin = 0;
   let draw = 0;
@@ -189,7 +124,10 @@ function computePoissonMatrixOutcomes(
 
   for (let i = 0; i <= maxGoals; i++) {
     for (let j = 0; j <= maxGoals; j++) {
-      const prob = pH[i] * pA[j];
+      const prob =
+        pH[i] *
+        pA[j] *
+        dixonColesTau(currentHome + i, currentAway + j, lambdaHomeRem, lambdaAwayRem, rho);
       const finalH = currentHome + i;
       const finalA = currentAway + j;
       if (finalH > finalA) homeWin += prob;
@@ -364,18 +302,23 @@ export function evaluateSpreadLine(
 
 // ---------------- SPORT MODELS ----------------
 
-function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictSoccer(
+  snapshot: OddsFreeMatchSnapshot,
+  params: SoccerModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
   const rem = Math.max(0, 1 - p);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
 
   // Base per-90 goal expectation (prior ~1.42 home, ~1.18 away)
-  const priorHome90 = clamp(1.42 + diffPrior * 1.15, 0.65, 2.55);
-  const priorAway90 = clamp(1.18 - diffPrior * 1.15, 0.55, 2.35);
+  const priorHome90 = clamp(params.homeGoalsPer90 + diffPrior * params.recordTilt, 0.65, 2.55);
+  const priorAway90 = clamp(params.awayGoalsPer90 - diffPrior * params.recordTilt, 0.55, 2.35);
 
   // Live boxscore intensity shrunk with Bayesian pseudo-minutes (35m prior weight)
   const elapsedMin = Math.max(1, p * 90);
@@ -399,7 +342,7 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       (0.85 + (aPoss / 100) * 0.3) +
     0.15;
 
-  const hasBox = hasLiveBoxscoreMetrics(h) || hasLiveBoxscoreMetrics(a);
+  const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
   let blendedHome90 = hasBox
     ? priorHome90 * (1 - shrinkage) + clamp(liveHome90, 0.35, 3.6) * shrinkage
     : priorHome90;
@@ -408,7 +351,11 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     : priorAway90;
 
   // Play-by-play recency-decayed flow adjustment
-  const flow = computeRecencyFlowScore(snapshot.plays, p, 90, 0.08);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * 90,
+    scaleMinutes: 90,
+    decayRate: 0.08,
+  });
   if (flow.count > 0) {
     const flowShareH = flow.homeFlow / Math.max(0.01, flow.homeFlow + flow.awayFlow);
     const flowTilt = (flowShareH - 0.5) * 0.55;
@@ -453,7 +400,8 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
           snapshot.awayScore,
           homeLambdaRem,
           awayLambdaRem,
-          10
+          10,
+          params.rho
         );
 
   const nonDraw = Math.max(0.001, homeWin + awayWin);
@@ -463,6 +411,9 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     matchId: snapshot.id,
     sport: 'soccer',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
     fairProbs: {
       homeWin,
@@ -492,7 +443,7 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       blendedHome90,
       blendedAway90
     ),
-    confidence: clamp(0.45 + 0.35 * p + (tier === 'play_by_play_boxscore' ? 0.2 : tier === 'live_boxscore' ? 0.1 : 0), 0.35, 0.96),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
       `Per-90 goal intensities: ${blendedHome90.toFixed(2)} vs ${blendedAway90.toFixed(2)}`,
       `Remaining joint Poisson λ: (${homeLambdaRem.toFixed(2)}, ${awayLambdaRem.toFixed(2)})`,
@@ -511,20 +462,27 @@ function predictSoccer(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   return basePred;
 }
 
-function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictBasketball(
+  snapshot: OddsFreeMatchSnapshot,
+  params: BasketballModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
   const rem = Math.max(0, 1 - p);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
   const regMinutes = snapshot.regulationMinutes ?? (snapshot.league.includes('nba') ? 48 : 40);
   const isNba = snapshot.league.includes('nba');
-  const priorTeamTotal = isNba ? 113.5 : 73.5;
+  const priorTeamTotal = isNba ? params.nbaTeamTotal : params.otherTeamTotal;
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
 
   // Prior full-game margin & total
-  const priorMargin = diffPrior * (isNba ? 24 : 26) + (isNba ? 2.1 : 2.8);
+  const priorMargin =
+    diffPrior * (isNba ? params.marginRecordTilt : params.otherMarginRecordTilt) +
+    (isNba ? params.marginHomeAdv : params.otherMarginHomeAdv);
   const priorTotal = priorTeamTotal * 2;
 
   const currentTotal = snapshot.homeScore + snapshot.awayScore;
@@ -540,13 +498,17 @@ function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction 
   const hReb = h.rebounds ?? 0;
   const aReb = a.rebounds ?? 0;
 
-  const hasBox = hasLiveBoxscoreMetrics(h) || hasLiveBoxscoreMetrics(a);
+  const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
   const effEdge = hasBox
     ? (hFg - aFg) * 0.28 + (h3p - a3p) * 0.14 + (aTo - hTo) * 0.45 + (hReb - aReb) * 0.16
     : 0;
 
   // Play-by-play recent scoring run momentum
-  const flow = computeRecencyFlowScore(snapshot.plays, p, regMinutes, 0.14);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * regMinutes,
+    scaleMinutes: regMinutes,
+    decayRate: 0.14,
+  });
   const flowMarginAdj =
     flow.count > 0
       ? ((flow.homeFlow - flow.awayFlow) / Math.max(1, flow.homeFlow + flow.awayFlow)) * 3.8
@@ -570,11 +532,11 @@ function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction 
   const marginStd =
     snapshot.status === 'finished'
       ? 0.01
-      : 12.2 * Math.sqrt(Math.max(0.01, 1 - p + 0.04));
+      : params.marginStdBase * Math.sqrt(Math.max(0.01, 1 - p + 0.04));
   const totalStd =
     snapshot.status === 'finished'
       ? 0.01
-      : 15.8 * Math.sqrt(Math.max(0.01, 1 - p + 0.04));
+      : params.totalStdBase * Math.sqrt(Math.max(0.01, 1 - p + 0.04));
 
   const homeWin =
     snapshot.status === 'finished'
@@ -590,6 +552,9 @@ function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction 
     matchId: snapshot.id,
     sport: 'basketball',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
     fairProbs: {
       homeWin,
@@ -612,8 +577,8 @@ function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction 
       totalStd,
     },
     standardLines: { totalLines: [], spreadLines: [] },
-    momentumSeries: buildMomentumSeries(snapshot.plays, p, Math.max(0.2, 0.5 + effEdge * 0.02), Math.max(0.2, 0.5 - effEdge * 0.02)),
-    confidence: clamp(0.45 + 0.35 * p + (tier === 'play_by_play_boxscore' ? 0.2 : tier === 'live_boxscore' ? 0.1 : 0), 0.35, 0.97),
+    momentumSeries: buildMomentumSeries(snapshot.plays, p, Math.max(0.2, 0.5 + effEdge * 0.02), Math.max(0.2, 0.5 - effEdge * 0.02), regMinutes),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
       `Projected final margin: ${expectedFinalMargin >= 0 ? '+' : ''}${expectedFinalMargin.toFixed(1)} (σ=${marginStd.toFixed(1)})`,
       `Projected final total: ${expectedFinalTotal.toFixed(1)} (σ=${totalStd.toFixed(1)})`,
@@ -634,22 +599,27 @@ function predictBasketball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction 
   return pred;
 }
 
-function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictFootball(
+  snapshot: OddsFreeMatchSnapshot,
+  params: FootballModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
   const rem = Math.max(0, 1 - p);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
 
-  const priorTotal = 45.5;
-  const priorMargin = diffPrior * 19 + 1.8;
+  const priorTotal = params.totalMean;
+  const priorMargin = diffPrior * params.marginRecordTilt + params.marginHomeAdv;
 
   const currentTotal = snapshot.homeScore + snapshot.awayScore;
   const currentMargin = snapshot.homeScore - snapshot.awayScore;
 
-  const hasBox = hasLiveBoxscoreMetrics(h) || hasLiveBoxscoreMetrics(a);
+  const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
   const hYards = h.totalYards ?? (h.passingYards ?? 0) + (h.rushingYards ?? 0);
   const aYards = a.totalYards ?? (a.passingYards ?? 0) + (a.rushingYards ?? 0);
   const h1st = h.firstDowns ?? 0;
@@ -663,7 +633,11 @@ function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     ? (hYards - aYards) * 0.032 + (h1st - a1st) * 0.42 + (aTo - hTo) * 2.6 + (h3rd - a3rd) * 0.06
     : 0;
 
-  const flow = computeRecencyFlowScore(snapshot.plays, p, 60, 0.1);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * 60,
+    scaleMinutes: 60,
+    decayRate: 0.1,
+  });
   const flowAdj =
     flow.count > 0
       ? ((flow.homeFlow - flow.awayFlow) / Math.max(1, flow.homeFlow + flow.awayFlow)) * 3.2
@@ -689,11 +663,11 @@ function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   const marginStd =
     snapshot.status === 'finished'
       ? 0.01
-      : 13.8 * Math.sqrt(Math.max(0.01, 1 - p + 0.05));
+      : params.marginStdBase * Math.sqrt(Math.max(0.01, 1 - p + 0.05));
   const totalStd =
     snapshot.status === 'finished'
       ? 0.01
-      : 14.5 * Math.sqrt(Math.max(0.01, 1 - p + 0.05));
+      : params.totalStdBase * Math.sqrt(Math.max(0.01, 1 - p + 0.05));
 
   const homeWin =
     snapshot.status === 'finished'
@@ -708,6 +682,9 @@ function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     matchId: snapshot.id,
     sport: 'football',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
     fairProbs: {
       homeWin,
@@ -730,8 +707,8 @@ function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       totalStd,
     },
     standardLines: { totalLines: [], spreadLines: [] },
-    momentumSeries: buildMomentumSeries(snapshot.plays, p, Math.max(0.2, 0.5 + yardEdge * 0.02), Math.max(0.2, 0.5 - yardEdge * 0.02)),
-    confidence: clamp(0.45 + 0.35 * p + (tier === 'play_by_play_boxscore' ? 0.2 : tier === 'live_boxscore' ? 0.1 : 0), 0.35, 0.96),
+    momentumSeries: buildMomentumSeries(snapshot.plays, p, Math.max(0.2, 0.5 + yardEdge * 0.02), Math.max(0.2, 0.5 - yardEdge * 0.02), 60),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
       `Yards differential: ${hYards} vs ${aYards} | Turnovers: ${hTo} vs ${aTo}`,
       `Final margin μ=${expectedFinalMargin.toFixed(1)} (σ=${marginStd.toFixed(1)})`,
@@ -752,22 +729,27 @@ function predictFootball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   return pred;
 }
 
-function predictHockey(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictHockey(
+  snapshot: OddsFreeMatchSnapshot,
+  params: HockeyModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
   const rem = Math.max(0, 1 - p);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
 
   // Base ~3.05 goals per 60m per team
-  const priorHome60 = clamp(3.05 + diffPrior * 1.4, 1.8, 4.4);
-  const priorAway60 = clamp(2.85 - diffPrior * 1.4, 1.7, 4.2);
+  const priorHome60 = clamp(params.homeGoalsPer60 + diffPrior * params.recordTilt, 1.8, 4.4);
+  const priorAway60 = clamp(params.awayGoalsPer60 - diffPrior * params.recordTilt, 1.7, 4.2);
 
   const elapsedMin = Math.max(1, p * 60);
   const shrinkage = elapsedMin / (elapsedMin + 24);
-  const hasBox = hasLiveBoxscoreMetrics(h) || hasLiveBoxscoreMetrics(a);
+  const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
 
   const hSog = h.shotsOnTarget ?? h.shots ?? 0;
   const aSog = a.shotsOnTarget ?? a.shots ?? 0;
@@ -788,7 +770,11 @@ function predictHockey(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     ? priorAway60 * (1 - shrinkage) + clamp(liveAway60, 1.3, 5.2) * shrinkage
     : priorAway60;
 
-  const flow = computeRecencyFlowScore(snapshot.plays, p, 60, 0.09);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * 60,
+    scaleMinutes: 60,
+    decayRate: 0.09,
+  });
   if (flow.count > 0) {
     const shareH = flow.homeFlow / Math.max(0.01, flow.homeFlow + flow.awayFlow);
     const tilt = (shareH - 0.5) * 0.35;
@@ -817,17 +803,23 @@ function predictHockey(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   // Flow-weighted OT/SO tie split for 2-Way NHL Moneyline
   const otHomeShare = clamp(
     blendedHome60 / Math.max(0.1, blendedHome60 + blendedAway60),
-    0.35,
-    0.65
+    params.otShareMin,
+    params.otShareMax
   );
   const twoWayHome = clamp(reg.homeWin + reg.draw * otHomeShare, 0.01, 0.99);
   const twoWayAway = 1 - twoWayHome;
+  // Extra goals expected after regulation; kept out of regulation totals/spreads.
+  const expectedAdditionalGoals = clamp(reg.draw, 0, 1) * params.otGoalsPerTie;
 
   const pred: PureFlowPrediction = {
     matchId: snapshot.id,
     sport: 'hockey',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
+    expectedAdditionalGoals,
     fairProbs: {
       homeWin: twoWayHome,
       awayWin: twoWayAway,
@@ -846,8 +838,8 @@ function predictHockey(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       otHomeShare,
     },
     standardLines: { totalLines: [], spreadLines: [] },
-    momentumSeries: buildMomentumSeries(snapshot.plays, p, blendedHome60, blendedAway60),
-    confidence: clamp(0.45 + 0.35 * p + (tier === 'play_by_play_boxscore' ? 0.2 : tier === 'live_boxscore' ? 0.1 : 0), 0.35, 0.96),
+    momentumSeries: buildMomentumSeries(snapshot.plays, p, blendedHome60, blendedAway60, 60),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
       `60m goal rates: ${blendedHome60.toFixed(2)} vs ${blendedAway60.toFixed(2)} (OT share ${(otHomeShare * 100).toFixed(1)}%)`,
       `Remaining Poisson λ: (${homeLambdaRem.toFixed(2)}, ${awayLambdaRem.toFixed(2)})`,
@@ -866,22 +858,27 @@ function predictHockey(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   return pred;
 }
 
-function predictBaseball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictBaseball(
+  snapshot: OddsFreeMatchSnapshot,
+  params: BaseballModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
   const rem = Math.max(0, 1 - p);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
 
   // Base MLB ~4.45 runs per 9 innings per team
-  const priorHome9 = clamp(4.45 + diffPrior * 2.4, 2.5, 6.6);
-  const priorAway9 = clamp(4.25 - diffPrior * 2.4, 2.4, 6.4);
+  const priorHome9 = clamp(params.homeRunsPer9 + diffPrior * params.recordTilt, 2.5, 6.6);
+  const priorAway9 = clamp(params.awayRunsPer9 - diffPrior * params.recordTilt, 2.4, 6.4);
 
   const elapsedInnings = Math.max(0.5, p * 9);
   const shrinkage = elapsedInnings / (elapsedInnings + 4.5);
-  const hasBox = hasLiveBoxscoreMetrics(h) || hasLiveBoxscoreMetrics(a);
+  const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
 
   const hHits = h.baseballHits ?? 0;
   const aHits = a.baseballHits ?? 0;
@@ -902,7 +899,11 @@ function predictBaseball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     ? priorAway9 * (1 - shrinkage) + clamp(liveAway9, 1.8, 8.2) * shrinkage
     : priorAway9;
 
-  const flow = computeRecencyFlowScore(snapshot.plays, p, 9, 0.35);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * 9,
+    scaleMinutes: 9,
+    decayRate: 0.35,
+  });
   if (flow.count > 0) {
     const shareH = flow.homeFlow / Math.max(0.01, flow.homeFlow + flow.awayFlow);
     const tilt = (shareH - 0.5) * 0.3;
@@ -910,8 +911,21 @@ function predictBaseball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     blendedAway9 = clamp(blendedAway9 * (1 - tilt), 1.6, 8.5);
   }
 
-  const homeLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedHome9 * rem;
-  const awayLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedAway9 * rem;
+  let homeLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedHome9 * rem;
+  let awayLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedAway9 * rem;
+
+  // Bottom of the 9th (or later) with the home side ahead: the home team does
+  // not bat again and the game cannot be lost, so remaining at-bats are zero.
+  const isBottomHalf = /bot|bottom/i.test(snapshot.clockLabel);
+  const walkOff =
+    snapshot.status !== 'finished' &&
+    snapshot.period >= 9 &&
+    isBottomHalf &&
+    snapshot.homeScore > snapshot.awayScore;
+  if (walkOff) {
+    homeLambdaRem = 0;
+    awayLambdaRem = 0;
+  }
 
   const reg =
     snapshot.status === 'finished'
@@ -930,12 +944,18 @@ function predictBaseball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
 
   const extraShare = clamp(blendedHome9 / Math.max(0.1, blendedHome9 + blendedAway9) + 0.02, 0.4, 0.65);
   const twoWayHome = clamp(reg.homeWin + reg.draw * extraShare, 0.01, 0.99);
+  // Extra-inning runs are kept out of the 9-inning totals/spreads.
+  const expectedAdditionalGoals = walkOff ? 0 : reg.draw * params.extraInningsRunsShare;
 
   const pred: PureFlowPrediction = {
     matchId: snapshot.id,
     sport: 'baseball',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
+    expectedAdditionalGoals,
     fairProbs: {
       homeWin: twoWayHome,
       awayWin: 1 - twoWayHome,
@@ -954,8 +974,8 @@ function predictBaseball(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       extraInningHomeShare: extraShare,
     },
     standardLines: { totalLines: [], spreadLines: [] },
-    momentumSeries: buildMomentumSeries(snapshot.plays, p, blendedHome9, blendedAway9),
-    confidence: clamp(0.45 + 0.35 * p + (tier === 'play_by_play_boxscore' ? 0.2 : tier === 'live_boxscore' ? 0.1 : 0), 0.35, 0.96),
+    momentumSeries: buildMomentumSeries(snapshot.plays, p, blendedHome9, blendedAway9, 9),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
       `9-inning run projection: ${blendedHome9.toFixed(2)} vs ${blendedAway9.toFixed(2)}`,
       `Remaining Poisson λ: (${homeLambdaRem.toFixed(2)}, ${awayLambdaRem.toFixed(2)})`,
@@ -1022,9 +1042,14 @@ function solveTennisMatchWinProb(
   return dp(sH, sA, true);
 }
 
-function predictTennis(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
+function predictTennis(
+  snapshot: OddsFreeMatchSnapshot,
+  params: TennisModelParams,
+  parameterVersion: string
+): PureFlowPrediction {
   const p = clamp(snapshot.progressPct, 0, 1);
-  const tier = inferDataQuality(snapshot);
+  const evidence = assessEvidence(snapshot);
+  const tier = evidence.tier;
   const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
   const setsToWin: 2 | 3 = snapshot.bestOfSets === 5 ? 3 : 2;
 
@@ -1073,13 +1098,38 @@ function predictTennis(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       ? (completedGamesHome + 4 * (0.5 + diffPrior * 0.45)) / (totalGamesPlayed + 4)
       : 0.5 + diffPrior * 0.45;
 
-  const flow = computeRecencyFlowScore(snapshot.plays, p, 100, 0.08);
+  const flow = computeRecencyFlowScore(snapshot.plays, {
+    currentElapsedMinutes: p * 100,
+    scaleMinutes: 100,
+    decayRate: 0.08,
+  });
   const flowTilt =
     flow.count > 0
       ? ((flow.homeFlow - flow.awayFlow) / Math.max(1, flow.homeFlow + flow.awayFlow)) * 0.08
       : 0;
 
-  const pGameHome = clamp(gameWinRate + flowTilt, 0.25, 0.75);
+  // Serve/return quality: a point-level proxy from first-serve and ace/DF
+  // differential, blended with observed game win rate.
+  const h = snapshot.homeStats;
+  const a = snapshot.awayStats;
+  const pServeHome = clamp(
+    params.baseServeHome +
+      diffPrior * 0.1 +
+      ((h.firstServePct ?? 60) - 60) * 0.0012 +
+      ((h.aces ?? 0) - (h.doubleFaults ?? 0)) * 0.004,
+    0.45,
+    0.85
+  );
+  const pServeAway = clamp(
+    params.baseServeAway -
+      diffPrior * 0.1 +
+      ((a.firstServePct ?? 60) - 60) * 0.0012 +
+      ((a.doubleFaults ?? 0) - (a.aces ?? 0)) * 0.004,
+    0.45,
+    0.85
+  );
+  const serveModelGame = 0.5 * pServeHome + 0.5 * (1 - pServeAway);
+  const pGameHome = clamp(0.6 * serveModelGame + 0.4 * gameWinRate + flowTilt, 0.25, 0.75);
   const pCurrentSetH = solveTennisSetWinProb(curH, curA, pGameHome);
   const pFreshSetH = solveTennisSetWinProb(0, 0, pGameHome);
 
@@ -1124,6 +1174,9 @@ function predictTennis(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
     matchId: snapshot.id,
     sport: 'tennis',
     dataQuality: tier,
+    modelVersion: MODEL_VERSION,
+    parameterVersion,
+    evidence,
     progressPct: p,
     fairProbs: {
       homeWin: pMatchHome,
@@ -1158,9 +1211,10 @@ function predictTennis(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
       gameSpreadStd,
     },
     standardLines: { totalLines: [], spreadLines: [] },
-    momentumSeries: buildMomentumSeries(snapshot.plays, p, pGameHome, 1 - pGameHome),
-    confidence: clamp(0.48 + 0.32 * p + (tier === 'play_by_play_boxscore' ? 0.18 : 0.1), 0.4, 0.96),
+    momentumSeries: buildMomentumSeries(snapshot.plays, p, pGameHome, 1 - pGameHome, 100),
+    confidence: evidenceConfidence(evidence),
     modelNotes: [
+      `Serve proxies: hold ${(pServeHome * 100).toFixed(1)}% vs ${(pServeAway * 100).toFixed(1)}%`,
       `Markov set win P(current)=${(pCurrentSetH * 100).toFixed(1)}%, P(game)=${(pGameHome * 100).toFixed(1)}%`,
       `Sets: ${homeSetsWon}-${awaySetsWon} (Current games ${curH}-${curA})`,
     ],
@@ -1179,27 +1233,120 @@ function predictTennis(snapshot: OddsFreeMatchSnapshot): PureFlowPrediction {
   return pred;
 }
 
+export interface PredictOptions {
+  /** Candidate parameters (shadow/evaluation). Defaults are unchanged. */
+  params?: ModelParameterOverrides;
+}
+
 /**
  * Stage 1 Entrypoint:
  * Always strips odds internally via stripOddsForFirewall so Stage 1 math
  * can never read bookmaker prices.
  */
+/**
+ * Applies an out-of-sample probability calibration gamma: p' = p^gamma
+ * renormalized inside each mutually exclusive market. Push mass is preserved.
+ */
+export function applyProbabilityCalibration(
+  prediction: PureFlowPrediction,
+  gamma: number
+): PureFlowPrediction {
+  if (!Number.isFinite(gamma) || gamma <= 0 || Math.abs(gamma - 1) < 1e-9) {
+    return prediction;
+  }
+  const pow = (p: number) =>
+    Math.pow(Math.max(0, Math.min(1, Number.isFinite(p) ? p : 0)), gamma);
+
+  const fairProbs = { ...prediction.fairProbs };
+  const trio = ['homeWin', 'draw', 'awayWin'] as const;
+  const present = trio.filter((key) => Number.isFinite(fairProbs[key] as number));
+  const trioSum = present.reduce((acc, key) => acc + pow(fairProbs[key] as number), 0);
+  if (trioSum > 0) {
+    for (const key of present) {
+      (fairProbs as Record<string, number | undefined>)[key] =
+        pow(fairProbs[key] as number) / trioSum;
+    }
+  }
+
+  const pairs = [
+    ['nextGoalHome', 'nextGoalAway'],
+    ['dnbHome', 'dnbAway'],
+  ] as const;
+  for (const [a, b] of pairs) {
+    const pa = fairProbs[a];
+    const pb = fairProbs[b];
+    if (Number.isFinite(pa) && Number.isFinite(pb)) {
+      const sa = pow(pa as number);
+      const sb = pow(pb as number);
+      if (sa + sb > 0) {
+        (fairProbs as Record<string, number | undefined>)[a] = sa / (sa + sb);
+        (fairProbs as Record<string, number | undefined>)[b] = sb / (sa + sb);
+      }
+    }
+  }
+
+  const standardLines = {
+    totalLines: prediction.standardLines.totalLines.map((line) => {
+      const base = line.overProb + line.underProb;
+      const sa = pow(line.overProb);
+      const sb = pow(line.underProb);
+      if (sa + sb <= 0) return line;
+      return {
+        ...line,
+        overProb: (sa / (sa + sb)) * base,
+        underProb: (sb / (sa + sb)) * base,
+      };
+    }),
+    spreadLines: prediction.standardLines.spreadLines.map((line) => {
+      const base = line.homeCoverProb + line.awayCoverProb;
+      const sa = pow(line.homeCoverProb);
+      const sb = pow(line.awayCoverProb);
+      if (sa + sb <= 0) return line;
+      return {
+        ...line,
+        homeCoverProb: (sa / (sa + sb)) * base,
+        awayCoverProb: (sb / (sa + sb)) * base,
+      };
+    }),
+  };
+
+  return {
+    ...prediction,
+    fairProbs,
+    standardLines,
+    parameterVersion: `${prediction.parameterVersion}-cal${gamma}`,
+    modelNotes: [
+      ...prediction.modelNotes,
+      `out-of-sample probability calibration gamma=${gamma}`,
+    ],
+  };
+}
+
 export function predictPureFlow(
-  match: ScrapedMatch | OddsFreeMatchSnapshot
+  match: ScrapedMatch | OddsFreeMatchSnapshot,
+  options: PredictOptions = {}
 ): PureFlowPrediction {
   const snapshot = stripOddsForFirewall(match);
-  switch (snapshot.sport) {
-    case 'soccer':
-      return predictSoccer(snapshot);
-    case 'basketball':
-      return predictBasketball(snapshot);
-    case 'football':
-      return predictFootball(snapshot);
-    case 'hockey':
-      return predictHockey(snapshot);
-    case 'baseball':
-      return predictBaseball(snapshot);
-    case 'tennis':
-      return predictTennis(snapshot);
-  }
+  const params = resolveModelParams(options.params);
+  const version = params.version;
+  const predict = (): PureFlowPrediction => {
+    switch (snapshot.sport) {
+      case 'soccer':
+        return predictSoccer(snapshot, params.soccer, version);
+      case 'basketball':
+        return predictBasketball(snapshot, params.basketball, version);
+      case 'football':
+        return predictFootball(snapshot, params.football, version);
+      case 'hockey':
+        return predictHockey(snapshot, params.hockey, version);
+      case 'baseball':
+        return predictBaseball(snapshot, params.baseball, version);
+      case 'tennis':
+        return predictTennis(snapshot, params.tennis, version);
+    }
+  };
+
+  const prediction = predict();
+  const gamma = params.calibration?.perSport?.[snapshot.sport]?.gamma;
+  return gamma === undefined ? prediction : applyProbabilityCalibration(prediction, gamma);
 }

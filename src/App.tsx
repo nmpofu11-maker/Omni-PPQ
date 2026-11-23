@@ -21,6 +21,7 @@ import {
   playQuantChime,
   triggerOsNotification,
 } from './utils/notifications';
+import { mutationHeaders } from './utils/api';
 
 type WorkspaceTab = 'radar' | 'alerts' | 'portfolio';
 
@@ -238,7 +239,7 @@ export default function App() {
     try {
       const res = await fetch('/api/bets', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: mutationHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           matchId: alert.matchId,
           sport: alert.sport,
@@ -279,7 +280,10 @@ export default function App() {
   const handleSettleAll = async () => {
     setSettling(true);
     try {
-      const res = await fetch('/api/bets/settle', { method: 'POST' });
+      const res = await fetch('/api/bets/settle', {
+        method: 'POST',
+        headers: mutationHeaders(),
+      });
       const data = await res.json();
       if (res.ok) {
         setBankroll(data.bankroll);
@@ -299,6 +303,7 @@ export default function App() {
   const handleDeleteBet = async (betId: string) => {
     const res = await fetch(`/api/bets/${encodeURIComponent(betId)}`, {
       method: 'DELETE',
+      headers: mutationHeaders(),
     });
     if (res.ok) {
       const data = await res.json();
@@ -309,7 +314,10 @@ export default function App() {
   };
 
   const handleResetPortfolio = async () => {
-    const res = await fetch('/api/bets/reset', { method: 'POST' });
+    const res = await fetch('/api/bets/reset', {
+      method: 'POST',
+      headers: mutationHeaders(),
+    });
     if (res.ok) {
       const data = await res.json();
       setBankroll(data.bankroll);

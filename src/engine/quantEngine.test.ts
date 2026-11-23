@@ -278,6 +278,10 @@ test('Stage 2 Value Engine filters verifiedLiveOnly and Conviction Score penaliz
       totalLine: 224.5,
       overOdds: 1.91,
       underOdds: 1.91,
+      priceKind: 'live',
+      source: 'ESPN Bet',
+      capturedAt: '2026-11-23T17:59:30.000Z',
+      marketId: 'nba-test:ESPN Bet',
       isLiveVerified: true,
     },
   });
@@ -295,13 +299,13 @@ test('Stage 2 Value Engine filters verifiedLiveOnly and Conviction Score penaliz
     status: nba.status,
     dataQuality: nba.dataQuality,
     progressPct: nba.progressPct,
-  }, { verifiedLiveOnly: true });
+  }, { verifiedLiveOnly: true, now: new Date('2026-11-23T18:00:00Z') });
   assert.ok(liveAlerts.length > 0);
   assert.ok(liveAlerts.every((a) => a.oddsVerifiedLive));
 
   const preMatchOnly = evaluateBettingValue(
     pred,
-    { ...nba.odds!, isLiveVerified: false },
+    { ...nba.odds!, isLiveVerified: false, priceKind: 'closing' },
     {
       id: nba.id,
       sport: nba.sport,
@@ -315,7 +319,7 @@ test('Stage 2 Value Engine filters verifiedLiveOnly and Conviction Score penaliz
       dataQuality: nba.dataQuality,
       progressPct: nba.progressPct,
     },
-    { verifiedLiveOnly: true }
+    { verifiedLiveOnly: true, now: new Date('2026-11-23T18:00:00Z') }
   );
   assert.equal(preMatchOnly.length, 0);
 

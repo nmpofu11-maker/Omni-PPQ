@@ -7,8 +7,9 @@ import {
   SportType,
   ValueAlert,
 } from '../types/quant';
-import { clamp, decimalToImpliedProb, probToDecimalOdds } from './mathUtils';
+import { clamp, decimalToImpliedProb, kellyFraction, probToDecimalOdds } from './mathUtils';
 import { evaluateSpreadLine, evaluateTotalLine } from './predictionEngine';
+import { verifyMarketOdds } from './oddsVerification';
 
 export interface MatchValueMeta {
   id: string;
@@ -28,7 +29,17 @@ export interface EvaluateValueOptions {
   verifiedLiveOnly?: boolean;
   minEvPct?: number;
   includeFinished?: boolean;
+  /** Default: refuse to recommend against an unprovenanced price. */
+  requireVerifiedPrice?: boolean;
+  now?: Date;
+  maxPriceAgeSec?: number;
 }
+
+const DATA_QUALITY_SCORE: Record<DataQualityTier, number> = {
+  play_by_play_boxscore: 1,
+  live_boxscore: 0.66,
+  record_prior: 0.25,
+};
 
 function calcEvAndQuarterKelly(
   winProb: number,
@@ -41,12 +52,9 @@ function calcEvAndQuarterKelly(
   const b = decimalOdds - 1;
   const ev = winProb * b - lossProb;
   const evPct = Math.round(ev * 1000) / 10;
-  if (ev <= 0) {
-    return { evPct, kellyQuarterPct: 0 };
-  }
-  // Exact Kelly for win/loss/push: f* = (winProb * b - lossProb) / b
-  const kellyFull = ev / b;
-  const kellyQuarterPct = Math.round(clamp(kellyFull * 0.25 * 100, 0, 5.0) * 100) / 100;
+  const kellyFull = kellyFraction(winProb, lossProb, decimalOdds);
+  const kellyQuarterPct =
+    kellyFull <= 0 ? 0 : Math.round(clamp(kellyFull * 0.25 * 100, 0, 5.0) * 100) / 100;
   return { evPct, kellyQuarterPct };
 }
 
@@ -55,7 +63,9 @@ function calcEvAndQuarterKelly(
  * 1. Positive EV magnitude (diminishing returns + suspicion penalty > +30% EV)
  * 2. Live telemetry data depth (play_by_play_boxscore > live_boxscore > record_prior)
  * 3. Odds verification status (Verified Live > Pre-Match / Closing)
- * 4. Match elapsed progress & Quarter-Kelly sizing consistency
+ * 4. Quarter-Kelly sizing consistency
+ * Elapsed match progress is deliberately excluded: time on the clock is not
+ * evidence quality and must not inflate conviction.
  */
 export function computeConvictionScore(
   alert: Pick<
@@ -68,8 +78,6 @@ export function computeConvictionScore(
   if (ev <= 0) return 0;
 
   const dataQuality = meta?.dataQuality ?? alert.dataQuality;
-  const progressPct = clamp(meta?.progressPct ?? alert.progressPct, 0, 1);
-  const status = meta?.status ?? 'live';
 
   // 1. EV Score (0..36 pts) with concave diminishing returns and suspicion penalty > 30% EV
   let evScore = 0;
@@ -92,26 +100,13 @@ export function computeConvictionScore(
   // 3. Odds Verification (0..22 pts)
   const oddsScore = alert.oddsVerifiedLive ? 22 : 8;
 
-  // 4. Sample Elapsed Progress & Quarter-Kelly Consistency (0..16 pts)
-  let sampleScore = 0;
-  if (status === 'upcoming') {
-    sampleScore = 4;
-  } else if (progressPct >= 0.15 && progressPct <= 0.88) {
-    sampleScore = 10;
-  } else if (progressPct > 0.88) {
-    // Late game garbage time / low remaining variance
-    sampleScore = 7;
-  } else {
-    sampleScore = 6;
-  }
-
   const kellyConsistency = clamp(alert.kellyQuarterStakePct / 3.0, 0, 1) * 6;
 
   // Extreme longshot penalty (e.g. > 8.0 decimal odds has higher model tail sensitivity)
   const oddsTailPenalty = alert.bookmakerOdds > 7.5 ? Math.min(8, (alert.bookmakerOdds - 7.5) * 1.2) : 0;
 
   return Math.round(
-    clamp(evScore + tierScore + oddsScore + sampleScore + kellyConsistency - oddsTailPenalty, 1, 99)
+    clamp(evScore + tierScore + oddsScore + kellyConsistency - oddsTailPenalty, 1, 99)
   );
 }
 
@@ -150,14 +145,31 @@ export function evaluateBettingValue(
   if (!options.includeFinished && meta.status === 'finished') return [];
 
   const minEvPct = options.minEvPct ?? 1.5;
-  const verifiedLiveOnly = options.verifiedLiveOnly ?? false;
-  if (verifiedLiveOnly && !marketOdds.isLiveVerified) {
+  const requireVerifiedPrice = options.requireVerifiedPrice ?? true;
+
+  // Verification is recomputed against the selected price and the current
+  // time; a producer flag alone is never trusted.
+  const verification = verifyMarketOdds(marketOdds, {
+    matchStatus: meta.status,
+    now: options.now,
+    maxAgeSec: options.maxPriceAgeSec,
+    liveMaxAgeSec: Math.min(options.maxPriceAgeSec ?? 180, 180),
+  });
+  if (requireVerifiedPrice && !verification.verified) {
     return [];
   }
 
-  const oddsLabel: ValueAlert['oddsLabel'] = marketOdds.isLiveVerified
+  const verifiedLiveOnly = options.verifiedLiveOnly ?? false;
+  if (verifiedLiveOnly && !verification.isLiveVerified) {
+    return [];
+  }
+
+  const oddsVerifiedLive = verification.isLiveVerified;
+  const oddsLabel: ValueAlert['oddsLabel'] = oddsVerifiedLive
     ? 'Verified Live'
     : 'Pre-Match / Closing';
+  const priceKind = marketOdds.priceKind ?? 'unknown';
+  const dataQualityScore = DATA_QUALITY_SCORE[meta.dataQuality] ?? 0.25;
 
   const candidates: ValueAlert[] = [];
 
@@ -167,6 +179,7 @@ export function evaluateBettingValue(
     side: ValueAlert['side'],
     winProb: number,
     lossProb: number,
+    pushProb: number,
     bookmakerOdds: number | undefined,
     line?: number
   ) => {
@@ -180,7 +193,7 @@ export function evaluateBettingValue(
     );
     if (evPct < minEvPct) return;
 
-    const fairOdds = probToDecimalOdds(winProb);
+    const fairOdds = probToDecimalOdds(winProb, pushProb);
     const impliedProb = decimalToImpliedProb(bookmakerOdds);
 
     const draft: ValueAlert = {
@@ -200,16 +213,28 @@ export function evaluateBettingValue(
       line,
       fairProb: Math.round(winProb * 10000) / 10000,
       fairOdds,
+      lossProb: Math.round(clamp(lossProb, 0, 1) * 10000) / 10000,
+      pushProb: Math.round(clamp(pushProb, 0, 1) * 10000) / 10000,
       bookmakerOdds: Math.round(bookmakerOdds * 100) / 100,
       impliedProb: Math.round(impliedProb * 10000) / 10000,
       evPct,
       kellyQuarterStakePct: kellyQuarterPct,
-      oddsVerifiedLive: marketOdds.isLiveVerified,
+      oddsVerifiedLive,
       oddsLabel,
+      priceVerified: verification.verified,
+      priceKind,
+      priceSource: marketOdds.source ?? marketOdds.provider,
+      priceCapturedAt: marketOdds.capturedAt ?? marketOdds.lastUpdated,
       provider: marketOdds.provider,
       dataQuality: meta.dataQuality,
       progressPct: meta.progressPct,
+      modelProbability: Math.round(winProb * 10000) / 10000,
+      dataQualityScore,
+      uncertaintyScore:
+        Math.round(clamp(1 - prediction.confidence, 0, 1) * 10000) / 10000,
+      calibrationScore: 1,
       convictionScore: 0,
+      rankingScore: 0,
     };
 
     draft.convictionScore = computeConvictionScore(draft, {
@@ -217,6 +242,7 @@ export function evaluateBettingValue(
       dataQuality: meta.dataQuality,
       status: meta.status,
     });
+    draft.rankingScore = draft.convictionScore;
     candidates.push(draft);
   };
 
@@ -227,22 +253,22 @@ export function evaluateBettingValue(
     const pDraw = prediction.fairProbs.draw ?? 0;
     const pAway = prediction.fairProbs.awayWin;
 
-    pushCandidate(mlCategory, `${meta.homeTeam} Win`, 'home', pHome, 1 - pHome, marketOdds.moneylineHome);
+    pushCandidate(mlCategory, `${meta.homeTeam} Win`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome);
     if (marketOdds.moneylineDraw) {
-      pushCandidate(mlCategory, 'Draw', 'draw', pDraw, 1 - pDraw, marketOdds.moneylineDraw);
+      pushCandidate(mlCategory, 'Draw', 'draw', pDraw, 1 - pDraw, 0, marketOdds.moneylineDraw);
     }
-    pushCandidate(mlCategory, `${meta.awayTeam} Win`, 'away', pAway, 1 - pAway, marketOdds.moneylineAway);
+    pushCandidate(mlCategory, `${meta.awayTeam} Win`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway);
   } else {
     const pHome = prediction.fairProbs.homeWin;
     const pAway = prediction.fairProbs.awayWin;
-    pushCandidate(mlCategory, `${meta.homeTeam} ML`, 'home', pHome, 1 - pHome, marketOdds.moneylineHome);
-    pushCandidate(mlCategory, `${meta.awayTeam} ML`, 'away', pAway, 1 - pAway, marketOdds.moneylineAway);
+    pushCandidate(mlCategory, `${meta.homeTeam} ML`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome);
+    pushCandidate(mlCategory, `${meta.awayTeam} ML`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway);
   }
 
   // 2. Dynamic Spread / Handicap / Run Line / Puck Line
   if (marketOdds.spreadLine !== undefined && Number.isFinite(marketOdds.spreadLine)) {
     const line = marketOdds.spreadLine;
-    const { homeCoverProb, awayCoverProb } = evaluateSpreadLine(prediction, line);
+    const { homeCoverProb, awayCoverProb, pushProb } = evaluateSpreadLine(prediction, line);
     const spreadCategory = getSpreadCategory(meta.sport);
     const homeLabel = `${meta.homeTeam} ${line > 0 ? `+${line}` : line}`;
     const awayLine = -line;
@@ -254,6 +280,7 @@ export function evaluateBettingValue(
       'home',
       homeCoverProb,
       awayCoverProb,
+      pushProb,
       marketOdds.spreadHomeOdds,
       line
     );
@@ -263,6 +290,7 @@ export function evaluateBettingValue(
       'away',
       awayCoverProb,
       homeCoverProb,
+      pushProb,
       marketOdds.spreadAwayOdds,
       awayLine
     );
@@ -271,7 +299,7 @@ export function evaluateBettingValue(
   // 3. Dynamic Over / Under Total
   if (marketOdds.totalLine !== undefined && Number.isFinite(marketOdds.totalLine)) {
     const line = marketOdds.totalLine;
-    const { overProb, underProb } = evaluateTotalLine(prediction, line);
+    const { overProb, underProb, pushProb } = evaluateTotalLine(prediction, line);
     const totalCategory = getTotalCategory(meta.sport);
 
     pushCandidate(
@@ -280,6 +308,7 @@ export function evaluateBettingValue(
       'over',
       overProb,
       underProb,
+      pushProb,
       marketOdds.overOdds,
       line
     );
@@ -289,6 +318,7 @@ export function evaluateBettingValue(
       'under',
       underProb,
       overProb,
+      pushProb,
       marketOdds.underOdds,
       line
     );

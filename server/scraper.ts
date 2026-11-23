@@ -9,7 +9,13 @@ import {
   TeamTelemetry,
 } from '../src/types/quant';
 import { americanToDecimalOdds, clamp } from '../src/engine/mathUtils';
-import { inferDataQuality } from '../src/engine/predictionEngine';
+import { inferDataQuality } from '../src/engine/evidence';
+import { parseSportClock } from '../src/engine/eventTime';
+import {
+  selectPriceFromNode,
+  verifyMarketOdds,
+  type PriceSide,
+} from '../src/engine/oddsVerification';
 import { CORE_LEAGUES, FULL_LEAGUE_CATALOG } from './leaguesCatalog';
 
 const ESPN_HOSTS = [
@@ -134,22 +140,6 @@ async function fetchBbcSoccerScores(): Promise<BbcMatchScore[]> {
   return results;
 }
 
-function parseClockToRemainingSeconds(displayClock: string | undefined): number | null {
-  if (!displayClock) return null;
-  const trimmed = displayClock.trim();
-  // Format MM:SS or M:SS
-  const mmss = trimmed.match(/^(\d+):(\d{1,2})/);
-  if (mmss) {
-    return Number(mmss[1]) * 60 + Number(mmss[2]);
-  }
-  // Format SS.x
-  const secs = trimmed.match(/^(\d+(?:\.\d+)?)$/);
-  if (secs) {
-    return Number(secs[1]);
-  }
-  return null;
-}
-
 export function normalizeClockAndProgress(
   sport: SportType,
   leagueSlug: string,
@@ -166,7 +156,7 @@ export function normalizeClockAndProgress(
   const state = statusNode?.type?.state; // 'pre' | 'in' | 'post'
   const completed = Boolean(statusNode?.type?.completed);
   const period = Number(statusNode?.period ?? 0);
-  const displayClock: string = statusNode?.displayClock || statusNode?.type?.shortDetail || '';
+  const clockText = String(statusNode?.displayClock ?? '').trim();
   const detail: string = statusNode?.type?.shortDetail || statusNode?.type?.detail || '';
 
   if (state === 'post' || completed) {
@@ -188,111 +178,116 @@ export function normalizeClockAndProgress(
     };
   }
 
+  const clampedPeriod = Math.max(1, period);
+
   if (sport === 'soccer') {
-    const minMatch = (displayClock || detail).match(/(\d+)/);
-    let mins = minMatch ? Number(minMatch[1]) : period >= 2 ? 60 : 20;
-    if (/ht|half/i.test(detail)) mins = 45;
-    const pct = clamp(mins / 90, 0.02, 0.99);
-    const label = /ht|half/i.test(detail) ? 'HT' : `${mins}'`;
-    return { status: 'live', clockLabel: label, period: Math.max(1, period), progressPct: pct, regulationMinutes: 90 };
+    const timingText = clockText || detail;
+    const parsed = parseSportClock({ sport, clock: timingText, period: clampedPeriod });
+    const progressPct = parsed
+      ? clamp(parsed.elapsedPct, 0.02, 0.99)
+      : clamp((clampedPeriod - 1) / 2, 0.02, 0.99);
+    const isHalfTime =
+      /^(ht|half|half-?time)$/i.test(timingText) || /ht|half-?time/i.test(detail);
+    const clockLabel = isHalfTime
+      ? 'HT'
+      : parsed
+        ? `${Math.round(parsed.elapsedMinutes)}'`
+        : detail || `P${clampedPeriod}`;
+    return { status: 'live', clockLabel, period: clampedPeriod, progressPct, regulationMinutes: 90 };
   }
 
   if (sport === 'basketball') {
     const isNba = leagueSlug === 'nba';
-    const isWnba = leagueSlug === 'wnba';
     const isMbb = leagueSlug === 'mens-college-basketball';
     // NBA: 4x12m (48m), WNBA: 4x10m (40m), NCAAM: 2x20m (40m), NCAAW: 4x10m (40m)
-    const numRegPeriods = isMbb ? 2 : 4;
+    const regPeriods = isMbb ? 2 : 4;
     const periodLenMin = isNba ? 12 : isMbb ? 20 : 10;
-    const regTotalMin = numRegPeriods * periodLenMin;
-    const remSec = parseClockToRemainingSeconds(displayClock) ?? periodLenMin * 30;
-    const clampedPeriod = Math.max(1, period);
+    const regTotal = regPeriods * periodLenMin;
+    const parsed = parseSportClock({
+      sport,
+      clock: clockText,
+      period: clampedPeriod,
+      periodLenMin,
+      regPeriods,
+    });
+    const progressPct = parsed
+      ? clamp(parsed.elapsedPct, 0.02, 0.99)
+      : clamp((clampedPeriod - 1) / regPeriods, 0.02, 0.99);
 
-    let elapsedMin = 0;
-    if (clampedPeriod <= numRegPeriods) {
-      elapsedMin = (clampedPeriod - 1) * periodLenMin + (periodLenMin - remSec / 60);
-    } else {
-      elapsedMin = regTotalMin;
-    }
-
-    const pct = clamp(elapsedMin / regTotalMin, 0.02, 0.99);
-    let clockLabel = '';
-    if (/halftime|half/i.test(detail)) {
-      clockLabel = 'HT';
-    } else if (clampedPeriod > numRegPeriods) {
-      clockLabel = `OT${clampedPeriod - numRegPeriods > 1 ? clampedPeriod - numRegPeriods : ''} ${displayClock}`.trim();
+    const isHalf = /halftime|half/i.test(clockText) || /halftime/i.test(detail);
+    const suffix = clockText && /\d+:\d{1,2}/.test(clockText) ? ` ${clockText}` : '';
+    let clockLabel: string;
+    if (isHalf) clockLabel = 'HT';
+    else if (clampedPeriod > regPeriods) {
+      const ot = clampedPeriod - regPeriods;
+      clockLabel = `OT${ot > 1 ? ot : ''}${suffix}`.trim();
     } else if (isMbb) {
-      clockLabel = `${clampedPeriod === 1 ? '1st' : '2nd'} ${displayClock}`.trim();
+      clockLabel = `${clampedPeriod === 1 ? '1st' : '2nd'}${suffix}`;
     } else {
-      clockLabel = `Q${clampedPeriod} ${displayClock}`.trim();
+      clockLabel = `Q${clampedPeriod}${suffix}`;
     }
 
     return {
       status: 'live',
       clockLabel,
       period: clampedPeriod,
-      progressPct: pct,
-      regulationMinutes: regTotalMin,
+      progressPct,
+      regulationMinutes: regTotal,
     };
   }
 
-  if (sport === 'football') {
-    const periodLenMin = 15;
-    const remSec = parseClockToRemainingSeconds(displayClock) ?? 450;
-    const clampedPeriod = Math.max(1, period);
-    const elapsedMin =
-      clampedPeriod <= 4
-        ? (clampedPeriod - 1) * periodLenMin + (periodLenMin - remSec / 60)
-        : 60;
-    const pct = clamp(elapsedMin / 60, 0.02, 0.99);
-    const label = /halftime/i.test(detail)
-      ? 'HT'
-      : clampedPeriod > 4
-        ? `OT ${displayClock}`.trim()
-        : `Q${clampedPeriod} ${displayClock}`.trim();
-    return {
-      status: 'live',
-      clockLabel: label,
+  if (sport === 'football' || sport === 'hockey') {
+    const periodLenMin = sport === 'football' ? 15 : 20;
+    const regPeriods = sport === 'football' ? 4 : 3;
+    const regTotal = regPeriods * periodLenMin;
+    const parsed = parseSportClock({
+      sport,
+      clock: clockText,
       period: clampedPeriod,
-      progressPct: pct,
-      regulationMinutes: 60,
-    };
-  }
+      periodLenMin,
+      regPeriods,
+    });
+    const progressPct = parsed
+      ? clamp(parsed.elapsedPct, 0.02, 0.99)
+      : clamp((clampedPeriod - 1) / regPeriods, 0.02, 0.99);
+    const suffix = clockText && /\d+:\d{1,2}/.test(clockText) ? ` ${clockText}` : '';
 
-  if (sport === 'hockey') {
-    const periodLenMin = 20;
-    const remSec = parseClockToRemainingSeconds(displayClock) ?? 600;
-    const clampedPeriod = Math.max(1, period);
-    const elapsedMin =
-      clampedPeriod <= 3
-        ? (clampedPeriod - 1) * periodLenMin + (periodLenMin - remSec / 60)
-        : 60;
-    const pct = clamp(elapsedMin / 60, 0.02, 0.99);
-    const ord = clampedPeriod === 1 ? '1st' : clampedPeriod === 2 ? '2nd' : clampedPeriod === 3 ? '3rd' : 'OT';
-    const label = /intermission/i.test(detail)
-      ? `${ord} Int`
-      : `${ord} ${displayClock}`.trim();
+    let clockLabel: string;
+    if (clampedPeriod > regPeriods) {
+      clockLabel = `OT${suffix}`.trim();
+    } else if (sport === 'football') {
+      clockLabel = /halftime/i.test(detail) ? 'HT' : `Q${clampedPeriod}${suffix}`;
+    } else {
+      const ord =
+        clampedPeriod === 1 ? '1st' : clampedPeriod === 2 ? '2nd' : '3rd';
+      clockLabel = /intermission/i.test(detail) ? `${ord} Int` : `${ord}${suffix}`;
+    }
+
     return {
       status: 'live',
-      clockLabel: label,
+      clockLabel,
       period: clampedPeriod,
-      progressPct: pct,
-      regulationMinutes: 60,
+      progressPct,
+      regulationMinutes: regTotal,
     };
   }
 
   if (sport === 'baseball') {
-    const inning = Math.max(1, period);
-    const isBot = /bot|bottom/i.test(detail);
-    const isMid = /mid/i.test(detail);
-    const isEnd = /end/i.test(detail);
-    const halfOffset = isBot ? 0.55 : isMid ? 0.5 : isEnd ? 0.95 : 0.15;
-    const pct = clamp((inning - 1 + halfOffset) / 9, 0.02, 0.99);
+    const inning = clampedPeriod;
+    const timingText = clockText || detail;
+    const parsed = parseSportClock({
+      sport,
+      clock: timingText,
+      period: inning,
+    });
+    const progressPct = parsed
+      ? clamp(parsed.elapsedPct, 0.02, 0.99)
+      : clamp((inning - 1) / 9, 0.02, 0.99);
     return {
       status: 'live',
-      clockLabel: detail || `Inn ${inning}`,
+      clockLabel: detail || (parsed ? timingText : `Inn ${inning}`),
       period: inning,
-      progressPct: pct,
+      progressPct,
     };
   }
 
@@ -472,131 +467,194 @@ export function extractTeamTelemetry(
 }
 
 /**
- * Extracts Bookmaker Market Odds from ESPN `pickcenter[0]` / `comp.odds[0]` / `summary.odds[0]`
- * Supports both structured (`moneyline`, `pointSpread`, `total`) and legacy (`overUnder`, `spread`, `awayTeamOdds.moneyLine`, `homeTeamOdds.moneyLine`) schemas.
- * Detects verified live odds nodes (`node.live?.odds` or `oddsNode.live`) vs pre-match/closing prices.
+ * Extracts Bookmaker Market Odds from ESPN `pickcenter[0]` / `comp.odds[0]` / `summary.odds[0]`.
+ *
+ * Every emitted price carries provenance (kind/source/capturedAt/marketId) so
+ * verification can be tied to the actual selected price. No price is ever
+ * fabricated: a missing quote stays missing and is not eligible for value.
  */
 export function extractMarketOdds(
   oddsNodes: any[] | undefined,
-  matchStatus: MatchStatus
+  matchStatus: MatchStatus,
+  context: { matchId?: string; now?: Date } = {}
 ): { odds?: MarketOdds; hasLiveOddsNode: boolean } {
   if (!Array.isArray(oddsNodes) || oddsNodes.length === 0) {
     return { odds: undefined, hasLiveOddsNode: false };
   }
 
-  // Prefer node with explicit live odds if present
-  const primary = oddsNodes.find((n) => Boolean(n?.live?.odds || n?.live)) || oddsNodes[0];
+  const isLiveNode = (n: any) =>
+    Boolean(n?.live?.odds) ||
+    Boolean(
+      n?.live &&
+        typeof n.live === 'object' &&
+        (n.live.moneyline || n.live.pointSpread || n.live.total)
+    );
+
+  const primary = oddsNodes.find(isLiveNode) ?? oddsNodes[0];
   if (!primary) return { odds: undefined, hasLiveOddsNode: false };
 
-  const liveSub = primary?.live?.odds || (primary?.live && typeof primary.live === 'object' ? primary.live : null);
+  const liveSub = isLiveNode(primary)
+    ? primary?.live?.odds ?? primary.live
+    : null;
   const hasLiveOddsNode = Boolean(liveSub);
-  const node = liveSub || primary;
 
-  const moneylineHome =
-    americanToDecimalOdds(node?.moneyline?.home?.close?.odds) ??
-    americanToDecimalOdds(node?.moneyline?.home?.live?.odds) ??
-    americanToDecimalOdds(node?.moneyline?.home?.open?.odds) ??
-    americanToDecimalOdds(node?.homeTeamOdds?.moneyLine) ??
-    americanToDecimalOdds(primary?.homeTeamOdds?.moneyLine);
+  const now = context.now ?? new Date();
+  const capturedAt = now.toISOString();
+  const providerName: string | undefined =
+    primary?.provider?.name || primary?.provider?.description || undefined;
 
-  const moneylineAway =
-    americanToDecimalOdds(node?.moneyline?.away?.close?.odds) ??
-    americanToDecimalOdds(node?.moneyline?.away?.live?.odds) ??
-    americanToDecimalOdds(node?.moneyline?.away?.open?.odds) ??
-    americanToDecimalOdds(node?.awayTeamOdds?.moneyLine) ??
-    americanToDecimalOdds(primary?.awayTeamOdds?.moneyLine);
+  type Pick = { american: number | string; kind: MarketOdds['priceKind'] };
 
-  const moneylineDraw =
-    americanToDecimalOdds(node?.moneyline?.draw?.close?.odds) ??
-    americanToDecimalOdds(node?.moneyline?.draw?.live?.odds) ??
-    americanToDecimalOdds(node?.drawOdds?.moneyLine) ??
-    americanToDecimalOdds(primary?.drawOdds?.moneyLine);
+  const pickMoneyline = (side: PriceSide): Pick | null => {
+    const live = liveSub ? selectPriceFromNode(liveSub, side, { kindHint: 'live' }) : null;
+    if (live) return live;
+    const fallback = selectPriceFromNode(primary, side);
+    if (fallback) return { american: fallback.american, kind: fallback.kind };
+    return null;
+  };
 
-  // Spread line (home team handicap)
+  const pickSpread = (side: 'home' | 'away'): Pick | null => {
+    if (liveSub?.pointSpread?.[side]) {
+      const p =
+        liveSub.pointSpread[side].live?.odds ??
+        liveSub.pointSpread[side].close?.odds ??
+        liveSub.pointSpread[side].open?.odds;
+      if (p !== undefined && p !== null) return { american: p, kind: 'live' };
+    }
+    const close = primary?.pointSpread?.[side]?.close?.odds;
+    if (close !== undefined && close !== null) return { american: close, kind: 'closing' };
+    const open = primary?.pointSpread?.[side]?.open?.odds;
+    if (open !== undefined && open !== null) return { american: open, kind: 'prematch' };
+    const legacy = primary?.[`${side}TeamOdds`]?.spreadOdds;
+    if (legacy !== undefined && legacy !== null && legacy !== '') {
+      return { american: legacy, kind: 'prematch' };
+    }
+    return null;
+  };
+
+  const pickTotal = (side: 'over' | 'under'): Pick | null => {
+    if (liveSub?.total?.[side]) {
+      const p =
+        liveSub.total[side].live?.odds ??
+        liveSub.total[side].close?.odds ??
+        liveSub.total[side].open?.odds;
+      if (p !== undefined && p !== null) return { american: p, kind: 'live' };
+    }
+    const close = primary?.total?.[side]?.close?.odds;
+    if (close !== undefined && close !== null) return { american: close, kind: 'closing' };
+    const open = primary?.total?.[side]?.open?.odds;
+    if (open !== undefined && open !== null) return { american: open, kind: 'prematch' };
+    const legacy = primary?.[`${side}Odds`];
+    if (legacy !== undefined && legacy !== null && legacy !== '') {
+      return { american: legacy, kind: 'prematch' };
+    }
+    return null;
+  };
+
+  const mlHome = pickMoneyline('home');
+  const mlAway = pickMoneyline('away');
+  const mlDraw = pickMoneyline('draw');
+  const spHome = pickSpread('home');
+  const spAway = pickSpread('away');
+  const totalOver = pickTotal('over');
+  const totalUnder = pickTotal('under');
+
   const rawSpreadLine =
-    node?.pointSpread?.home?.close?.line ??
-    node?.pointSpread?.home?.live?.line ??
-    node?.spread ??
+    liveSub?.pointSpread?.home?.live?.line ??
+    liveSub?.pointSpread?.home?.close?.line ??
+    primary?.pointSpread?.home?.close?.line ??
     primary?.spread;
   const spreadLine =
     rawSpreadLine !== undefined && rawSpreadLine !== null && rawSpreadLine !== ''
       ? Number.parseFloat(String(rawSpreadLine))
       : undefined;
 
-  const spreadHomeOdds =
-    americanToDecimalOdds(node?.pointSpread?.home?.close?.odds) ??
-    americanToDecimalOdds(node?.pointSpread?.home?.live?.odds) ??
-    americanToDecimalOdds(node?.homeTeamOdds?.spreadOdds) ??
-    americanToDecimalOdds(primary?.homeTeamOdds?.spreadOdds) ??
-    (spreadLine !== undefined ? 1.91 : undefined);
-
-  const spreadAwayOdds =
-    americanToDecimalOdds(node?.pointSpread?.away?.close?.odds) ??
-    americanToDecimalOdds(node?.pointSpread?.away?.live?.odds) ??
-    americanToDecimalOdds(node?.awayTeamOdds?.spreadOdds) ??
-    americanToDecimalOdds(primary?.awayTeamOdds?.spreadOdds) ??
-    (spreadLine !== undefined ? 1.91 : undefined);
-
-  // Total line
   const rawTotalLine =
-    node?.total?.over?.close?.line ??
-    node?.total?.over?.live?.line ??
-    node?.overUnder ??
+    liveSub?.total?.over?.live?.line ??
+    liveSub?.total?.over?.close?.line ??
+    primary?.total?.over?.close?.line ??
     primary?.overUnder;
   const totalLine =
     rawTotalLine !== undefined && rawTotalLine !== null && rawTotalLine !== ''
       ? Number.parseFloat(String(rawTotalLine).replace(/^[ou]/i, ''))
       : undefined;
 
-  const overOdds =
-    americanToDecimalOdds(node?.total?.over?.close?.odds) ??
-    americanToDecimalOdds(node?.total?.over?.live?.odds) ??
-    americanToDecimalOdds(node?.overOdds) ??
-    americanToDecimalOdds(primary?.overOdds) ??
-    (totalLine !== undefined ? 1.91 : undefined);
-
-  const underOdds =
-    americanToDecimalOdds(node?.total?.under?.close?.odds) ??
-    americanToDecimalOdds(node?.total?.under?.live?.odds) ??
-    americanToDecimalOdds(node?.underOdds) ??
-    americanToDecimalOdds(primary?.underOdds) ??
-    (totalLine !== undefined ? 1.91 : undefined);
+  const toDecimal = (p: Pick | null): number | undefined => {
+    if (!p) return undefined;
+    return americanToDecimalOdds(p.american) ?? undefined;
+  };
 
   if (
-    !moneylineHome &&
-    !moneylineAway &&
-    spreadLine === undefined &&
-    totalLine === undefined
+    !mlHome &&
+    !mlAway &&
+    !spHome &&
+    !spAway &&
+    !totalOver &&
+    !totalUnder
   ) {
-    return { odds: undefined, hasLiveOddsNode };
+    // Lines alone are still useful for display, but carry no usable prices.
+    return {
+      hasLiveOddsNode,
+      odds: {
+        spreadLine: Number.isFinite(spreadLine) ? spreadLine : undefined,
+        totalLine: Number.isFinite(totalLine) ? totalLine : undefined,
+        provider: providerName,
+        priceKind: 'unknown',
+        source: providerName,
+        capturedAt,
+        marketId: `${context.matchId ?? 'unknown'}:${providerName ?? 'unattributed'}`,
+        isLiveVerified: false,
+        lastUpdated: capturedAt,
+      },
+    };
   }
 
-  return {
-    hasLiveOddsNode,
-    odds: {
-      moneylineHome: moneylineHome ?? undefined,
-      moneylineDraw: moneylineDraw ?? undefined,
-      moneylineAway: moneylineAway ?? undefined,
-      spreadLine: Number.isFinite(spreadLine) ? spreadLine : undefined,
-      spreadHomeOdds: spreadHomeOdds ?? undefined,
-      spreadAwayOdds: spreadAwayOdds ?? undefined,
-      totalLine: Number.isFinite(totalLine) ? totalLine : undefined,
-      overOdds: overOdds ?? undefined,
-      underOdds: underOdds ?? undefined,
-      provider: primary?.provider?.name || 'ESPN Bet',
-      isLiveVerified: hasLiveOddsNode && matchStatus === 'live',
-      lastUpdated: new Date().toISOString(),
-    },
+  const kinds = [mlHome, mlAway, mlDraw, spHome, spAway, totalOver, totalUnder]
+    .filter((p): p is Pick => p !== null)
+    .map((p) => p.kind);
+  const priceKind: MarketOdds['priceKind'] = kinds.every((k) => k === 'live')
+    ? 'live'
+    : kinds.includes('closing')
+      ? 'closing'
+      : 'prematch';
+
+  const draft: MarketOdds = {
+    moneylineHome: toDecimal(mlHome),
+    moneylineDraw: toDecimal(mlDraw),
+    moneylineAway: toDecimal(mlAway),
+    spreadLine: Number.isFinite(spreadLine) ? spreadLine : undefined,
+    spreadHomeOdds: toDecimal(spHome),
+    spreadAwayOdds: toDecimal(spAway),
+    totalLine: Number.isFinite(totalLine) ? totalLine : undefined,
+    overOdds: toDecimal(totalOver),
+    underOdds: toDecimal(totalUnder),
+    provider: providerName,
+    priceKind,
+    source: providerName,
+    capturedAt,
+    marketId: `${context.matchId ?? 'unknown'}:${providerName ?? 'unattributed'}`,
+    isLiveVerified: false,
+    lastUpdated: capturedAt,
   };
+
+  const verification = verifyMarketOdds(draft, {
+    matchStatus,
+    now,
+    maxAgeSec: 600,
+    liveMaxAgeSec: 180,
+  });
+  draft.verification = verification;
+  draft.isLiveVerified = verification.isLiveVerified;
+
+  return { hasLiveOddsNode, odds: draft };
 }
 
 function extractPlays(
   summaryJson: any,
   sport: SportType,
+  leagueSlug: string,
   homeTeamId?: string,
-  awayTeamId?: string,
-  homeName?: string,
-  awayName?: string
+  awayTeamId?: string
 ): PlayEvent[] {
   const rawList: any[] = [];
   if (Array.isArray(summaryJson?.plays)) rawList.push(...summaryJson.plays);
@@ -605,19 +663,38 @@ function extractPlays(
 
   if (rawList.length === 0) return [];
 
-  const totalItems = rawList.length;
+  const isNba = leagueSlug === 'nba';
+  const isMbb = leagueSlug === 'mens-college-basketball';
+  const periodLenMin =
+    sport === 'basketball' ? (isNba ? 12 : isMbb ? 20 : 10)
+      : sport === 'football' ? 15
+        : sport === 'hockey' ? 20
+          : undefined;
+  const regPeriods =
+    sport === 'basketball' ? (isMbb ? 2 : 4)
+      : sport === 'football' ? 4
+        : sport === 'hockey' ? 3
+          : undefined;
+
   return rawList.slice(-40).map((item, idx) => {
     const teamId = String(item?.team?.id ?? item?.participants?.[0]?.athlete?.team?.id ?? '');
     const text = String(item?.text || item?.shortText || item?.type?.text || '');
     let team: 'home' | 'away' | 'neutral' = 'neutral';
     if (homeTeamId && teamId === homeTeamId) team = 'home';
     else if (awayTeamId && teamId === awayTeamId) team = 'away';
-    else if (homeName && text.toLowerCase().includes(homeName.toLowerCase().split(' ')[0])) team = 'home';
-    else if (awayName && text.toLowerCase().includes(awayName.toLowerCase().split(' ')[0])) team = 'away';
 
-    const periodNum = Number(item?.period?.number ?? item?.period ?? 1);
-    const clock = String(item?.clock?.displayValue ?? item?.time?.displayValue ?? '');
-    const elapsedPct = clamp((idx + 1) / Math.max(1, totalItems), 0.02, 0.99);
+    const periodNum = Number(item?.period?.number ?? item?.period ?? 0);
+    const clock = String(item?.clock?.displayValue ?? item?.time?.displayValue ?? '').trim();
+    const canParse = Boolean(clock) && (sport === 'soccer' || periodNum >= 1);
+    const parsed = canParse
+      ? parseSportClock({
+          sport,
+          clock,
+          period: periodNum >= 1 ? periodNum : 1,
+          periodLenMin,
+          regPeriods,
+        })
+      : null;
 
     const typeText = String(item?.type?.text || item?.type || 'Play');
     let weight = 1.0;
@@ -631,9 +708,15 @@ function extractPlays(
 
     return {
       id: String(item?.id ?? `${idx}`),
-      clock: clock || `P${periodNum}`,
+      clock: clock || (periodNum >= 1 ? `P${periodNum}` : ''),
       period: periodNum,
-      elapsedPct,
+      elapsedPct: parsed?.elapsedPct,
+      elapsedMinutes: parsed?.elapsedMinutes,
+      clockSource: parsed
+        ? parsed.quality === 'clock'
+          ? ('scoreboard_clock' as const)
+          : ('period_only' as const)
+        : ('unknown' as const),
       team,
       type: typeText,
       text: text || typeText,
@@ -719,9 +802,12 @@ export function parseEspnScoreboardEvent(
       awayLinescores
     );
 
-    const { odds, hasLiveOddsNode } = extractMarketOdds(comp?.odds, status);
     const matchId = String(comp?.id || ev?.id);
     registerMatchSportPath(matchId, league.sportPath);
+
+    const { odds, hasLiveOddsNode } = extractMarketOdds(comp?.odds, status, {
+      matchId,
+    });
 
     const bestOfSets: 3 | 5 | undefined =
       league.sport === 'tennis'
@@ -782,14 +868,14 @@ export function parseEspnSummary(
   const awayTeamId = String(awayComp?.id || awayComp?.team?.id || '');
 
   const boxTeams: any[] = summaryJson?.boxscore?.teams ?? [];
+  // Never fall back to the opposing team's box: attributing one team's
+  // statistics to both sides would fake two-sided verification.
   const homeBox =
     boxTeams.find((b) => String(b?.team?.id) === homeTeamId) ||
-    boxTeams.find((b) => b?.homeAway === 'home') ||
-    boxTeams[1];
+    boxTeams.find((b) => b?.homeAway === 'home');
   const awayBox =
     boxTeams.find((b) => String(b?.team?.id) === awayTeamId) ||
-    boxTeams.find((b) => b?.homeAway === 'away') ||
-    boxTeams[0];
+    boxTeams.find((b) => b?.homeAway === 'away');
 
   const homeLinescores = extractLinescores(homeComp);
   const awayLinescores = extractLinescores(awayComp);
@@ -814,10 +900,9 @@ export function parseEspnSummary(
   const plays = extractPlays(
     summaryJson,
     baseMatch.sport,
+    baseMatch.league,
     homeTeamId,
-    awayTeamId,
-    baseMatch.homeTeam,
-    baseMatch.awayTeam
+    awayTeamId
   );
 
   const statusObj = headerComp?.status || baseMatch.status;
@@ -843,7 +928,9 @@ export function parseEspnSummary(
     ...(Array.isArray(headerComp?.odds) ? headerComp.odds : []),
     ...(Array.isArray(summaryJson?.odds) ? summaryJson.odds : []),
   ];
-  const extracted = extractMarketOdds(rawOddsNodes, clockParsed.status);
+  const extracted = extractMarketOdds(rawOddsNodes, clockParsed.status, {
+    matchId: baseMatch.id,
+  });
 
   const homeScore =
     homeComp?.score !== undefined
@@ -1059,17 +1146,27 @@ export async function fetchMatchSummary(
       const a = competitors.find((c) => c?.homeAway === 'away') || competitors[1] || {};
       const hName = extractCompetitorName(h);
       const aName = extractCompetitorName(a);
+      const clock = headerComp?.status
+        ? normalizeClockAndProgress(
+            sport,
+            slug || 'unknown',
+            headerComp.status,
+            extractLinescores(h),
+            extractLinescores(a)
+          )
+        : { status: 'upcoming' as MatchStatus, clockLabel: 'Scheduled', period: 0, progressPct: 0 };
       return {
         id: matchId,
         sport,
         league: slug || 'unknown',
         leagueName: summaryJson?.header?.league?.name || slug || 'League',
         sportPath,
-        status: 'live',
+        status: clock.status,
         startTime: headerComp?.date || new Date().toISOString(),
-        clockLabel: 'Live',
-        period: 1,
-        progressPct: 0.5,
+        clockLabel: clock.clockLabel,
+        period: clock.period,
+        progressPct: clock.progressPct,
+        regulationMinutes: clock.regulationMinutes,
         homeTeam: hName.name,
         awayTeam: aName.name,
         homeAbbrev: hName.abbrev,

@@ -186,6 +186,7 @@ test('MLB nested batting/pitching boxscore and pickcenter summary odds parse acc
       plays: [{ id: 'pl1', period: { number: 6 }, clock: { displayValue: 'Top 6th' }, text: 'Double to left field' }],
       pickcenter: [
         {
+          provider: { name: 'ESPN Bet' },
           live: {
             odds: {
               moneyline: { home: { close: { odds: -180 } }, away: { close: { odds: 155 } } },
@@ -201,4 +202,122 @@ test('MLB nested batting/pitching boxscore and pickcenter summary odds parse acc
   assert.equal(enriched.plays.length, 1);
   assert.equal(enriched.odds?.isLiveVerified, true);
   assert.equal(enriched.odds?.totalLine, 8.5);
+});
+
+test('missing live clocks fall back to a period mark instead of an invented mid-period time', () => {
+  const nba = normalizeClockAndProgress('basketball', 'nba', {
+    period: 3,
+    type: { state: 'in', completed: false, shortDetail: 'Q3' },
+  });
+  assert.equal(nba.progressPct, 0.5);
+  assert.equal(nba.clockLabel, 'Q3');
+
+  const soccer = normalizeClockAndProgress('soccer', 'eng.1', {
+    period: 2,
+    type: { state: 'in', completed: false, shortDetail: '2nd Half' },
+  });
+  assert.equal(soccer.progressPct, 0.5);
+
+  // A real clock still wins over the period mark
+  const soccerClock = normalizeClockAndProgress('soccer', 'eng.1', {
+    period: 2,
+    displayClock: "67'",
+    type: { state: 'in', completed: false },
+  });
+  assert.ok(Math.abs(soccerClock.progressPct - 67 / 90) < 1e-6);
+});
+
+test('plays take timing from scoreboard clocks; untimed plays stay untimed', () => {
+  const baseMatch = parseEspnScoreboardEvent(
+    {
+      id: '777',
+      competitions: [
+        {
+          id: '777',
+          status: { period: 3, displayClock: '04:30', type: { state: 'in', shortDetail: 'Q3' } },
+          competitors: [
+            { homeAway: 'home', id: 'h1', team: { id: 'h1', displayName: 'Home' }, score: '80' },
+            { homeAway: 'away', id: 'a1', team: { id: 'a1', displayName: 'Away' }, score: '78' },
+          ],
+        },
+      ],
+    },
+    { slug: 'nba', name: 'NBA', sport: 'basketball', sportPath: 'basketball/nba' }
+  )[0];
+
+  const enriched = parseEspnSummary(
+    {
+      header: {
+        competitions: [
+          {
+            status: { period: 3, displayClock: '04:30', type: { state: 'in', shortDetail: 'Q3' } },
+            competitors: [
+              { homeAway: 'home', id: 'h1', team: { id: 'h1', displayName: 'Home' }, score: '80' },
+              { homeAway: 'away', id: 'a1', team: { id: 'a1', displayName: 'Away' }, score: '78' },
+            ],
+          },
+        ],
+      },
+      plays: [
+        { id: 'p1', period: { number: 3 }, clock: { displayValue: '06:00' }, team: { id: 'h1' }, text: 'Jumper' },
+        { id: 'p2', period: { number: 3 }, clock: { displayValue: '04:30' }, team: { id: 'a1' }, text: 'Layup' },
+        { id: 'p3', text: 'Timeout' },
+      ],
+    },
+    baseMatch
+  );
+
+  assert.equal(enriched.plays[0].elapsedMinutes, 30);
+  assert.equal(enriched.plays[0].clockSource, 'scoreboard_clock');
+  assert.equal(enriched.plays[1].elapsedMinutes, 31.5);
+  assert.equal(enriched.plays[1].team, 'away');
+  assert.equal(enriched.plays[2].clockSource, 'unknown');
+  assert.equal(enriched.plays[2].elapsedMinutes, undefined);
+  assert.equal(enriched.plays[2].elapsedPct, undefined);
+});
+
+test('one-sided boxscore telemetry never upgrades match quality', () => {
+  const baseMatch = parseEspnScoreboardEvent(
+    {
+      id: '888',
+      competitions: [
+        {
+          id: '888',
+          status: { period: 2, displayClock: '05:00', type: { state: 'in', shortDetail: 'Q2' } },
+          competitors: [
+            {
+              homeAway: 'home',
+              id: 'h1',
+              team: { id: 'h1', displayName: 'Home' },
+              score: '40',
+              statistics: [{ name: 'fieldGoalPct', value: 45 }],
+            },
+            { homeAway: 'away', id: 'a1', team: { id: 'a1', displayName: 'Away' }, score: '38' },
+          ],
+        },
+      ],
+    },
+    { slug: 'nba', name: 'NBA', sport: 'basketball', sportPath: 'basketball/nba' }
+  )[0];
+
+  const enriched = parseEspnSummary(
+    {
+      header: {
+        competitions: [
+          {
+            status: { period: 2, displayClock: '05:00', type: { state: 'in', shortDetail: 'Q2' } },
+            competitors: [
+              { homeAway: 'home', id: 'h1', team: { id: 'h1', displayName: 'Home' }, score: '40' },
+              { homeAway: 'away', id: 'a1', team: { id: 'a1', displayName: 'Away' }, score: '38' },
+            ],
+          },
+        ],
+      },
+      boxscore: { teams: [{ team: { id: 'h1' }, statistics: [{ name: 'fieldGoalPct', value: 45 }] }] },
+      plays: [{ id: 'p1', period: { number: 2 }, clock: { displayValue: '05:00' }, team: { id: 'h1' }, text: 'Jumper' }],
+    },
+    baseMatch
+  );
+
+  assert.equal(enriched.dataQuality, 'record_prior');
 });
