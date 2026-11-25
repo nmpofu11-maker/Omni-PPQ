@@ -33,6 +33,61 @@ export interface EvaluateValueOptions {
   requireVerifiedPrice?: boolean;
   now?: Date;
   maxPriceAgeSec?: number;
+  /**
+   * Weight on the model in a logit blend with the de-vigged market price,
+   * in [0, 1]. 1 = trust the model fully (no shrinkage). When omitted a
+   * default weight is chosen from the evidence tier (see DEFAULT_MODEL_WEIGHT).
+   * Shrinking toward the market counters the winner's curse: a bet is only
+   * selected when the model disagrees with the market, and a share of that
+   * disagreement is model error rather than edge.
+   */
+  modelWeight?: number;
+}
+
+/** Conservative defaults: thinner evidence means more shrinkage toward the market. */
+export const DEFAULT_MODEL_WEIGHT: Record<DataQualityTier, number> = {
+  play_by_play_boxscore: 0.8,
+  live_boxscore: 0.7,
+  record_prior: 0.5,
+};
+
+const logit = (p: number): number => {
+  const q = clamp(p, 1e-6, 1 - 1e-6);
+  return Math.log(q / (1 - q));
+};
+const expit = (x: number): number => 1 / (1 + Math.exp(-x));
+
+/**
+ * Shrink a model win/loss/push split toward the no-vig market probability.
+ * Works on the conditional (non-push) win probability and re-applies the push mass.
+ */
+export function shrinkTowardMarket(
+  winProb: number,
+  lossProb: number,
+  pushProb: number,
+  marketNoVigProb: number | null,
+  weight: number
+): { winProb: number; lossProb: number } {
+  const w = clamp(weight, 0, 1);
+  if (w >= 1 || marketNoVigProb === null || !Number.isFinite(marketNoVigProb)) {
+    return { winProb, lossProb };
+  }
+  const decided = winProb + lossProb;
+  if (!(decided > 0)) return { winProb, lossProb };
+  const modelCond = winProb / decided;
+  const blendedCond = expit(w * logit(modelCond) + (1 - w) * logit(marketNoVigProb));
+  return { winProb: blendedCond * decided, lossProb: (1 - blendedCond) * decided };
+}
+
+/** No-vig probability of one selection given every mutually exclusive price in its market. */
+export function noVigProbability(selfOdds: number | undefined, otherOdds: Array<number | undefined>): number | null {
+  const valid = (o: number | undefined): o is number => typeof o === 'number' && Number.isFinite(o) && o > 1.01;
+  if (!valid(selfOdds)) return null;
+  const others = otherOdds.filter(valid);
+  if (others.length === 0) return null;
+  const self = 1 / selfOdds;
+  const total = self + others.reduce((a, o) => a + 1 / o, 0);
+  return total > 0 ? self / total : null;
 }
 
 const DATA_QUALITY_SCORE: Record<DataQualityTier, number> = {
@@ -47,6 +102,9 @@ function calcEvAndQuarterKelly(
   decimalOdds: number
 ): { evPct: number; kellyQuarterPct: number } {
   if (!Number.isFinite(decimalOdds) || decimalOdds <= 1.01) {
+    return { evPct: -100, kellyQuarterPct: 0 };
+  }
+  if (!Number.isFinite(winProb) || !Number.isFinite(lossProb)) {
     return { evPct: -100, kellyQuarterPct: 0 };
   }
   const b = decimalOdds - 1;
@@ -181,11 +239,28 @@ export function evaluateBettingValue(
     lossProb: number,
     pushProb: number,
     bookmakerOdds: number | undefined,
-    line?: number
+    line?: number,
+    siblingOdds: Array<number | undefined> = []
   ) => {
     if (!bookmakerOdds || !Number.isFinite(bookmakerOdds) || bookmakerOdds <= 1.01) {
       return;
     }
+    const rawModelProb = winProb;
+    const envWeight = Number.parseFloat(process.env.MODEL_MARKET_WEIGHT ?? '');
+    const weight =
+      options.modelWeight ??
+      (Number.isFinite(envWeight) ? envWeight : undefined) ??
+      DEFAULT_MODEL_WEIGHT[meta.dataQuality] ??
+      0.7;
+    const shrunk = shrinkTowardMarket(
+      winProb,
+      lossProb,
+      pushProb,
+      noVigProbability(bookmakerOdds, siblingOdds),
+      weight
+    );
+    winProb = shrunk.winProb;
+    lossProb = shrunk.lossProb;
     const { evPct, kellyQuarterPct } = calcEvAndQuarterKelly(
       winProb,
       lossProb,
@@ -228,7 +303,7 @@ export function evaluateBettingValue(
       provider: marketOdds.provider,
       dataQuality: meta.dataQuality,
       progressPct: meta.progressPct,
-      modelProbability: Math.round(winProb * 10000) / 10000,
+      modelProbability: Math.round(rawModelProb * 10000) / 10000,
       dataQualityScore,
       uncertaintyScore:
         Math.round(clamp(1 - prediction.confidence, 0, 1) * 10000) / 10000,
@@ -253,16 +328,16 @@ export function evaluateBettingValue(
     const pDraw = prediction.fairProbs.draw ?? 0;
     const pAway = prediction.fairProbs.awayWin;
 
-    pushCandidate(mlCategory, `${meta.homeTeam} Win`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome);
+    pushCandidate(mlCategory, `${meta.homeTeam} Win`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome, undefined, [marketOdds.moneylineDraw, marketOdds.moneylineAway]);
     if (marketOdds.moneylineDraw) {
-      pushCandidate(mlCategory, 'Draw', 'draw', pDraw, 1 - pDraw, 0, marketOdds.moneylineDraw);
+      pushCandidate(mlCategory, 'Draw', 'draw', pDraw, 1 - pDraw, 0, marketOdds.moneylineDraw, undefined, [marketOdds.moneylineHome, marketOdds.moneylineAway]);
     }
-    pushCandidate(mlCategory, `${meta.awayTeam} Win`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway);
+    pushCandidate(mlCategory, `${meta.awayTeam} Win`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway, undefined, [marketOdds.moneylineHome, marketOdds.moneylineDraw]);
   } else {
     const pHome = prediction.fairProbs.homeWin;
     const pAway = prediction.fairProbs.awayWin;
-    pushCandidate(mlCategory, `${meta.homeTeam} ML`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome);
-    pushCandidate(mlCategory, `${meta.awayTeam} ML`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway);
+    pushCandidate(mlCategory, `${meta.homeTeam} ML`, 'home', pHome, 1 - pHome, 0, marketOdds.moneylineHome, undefined, [marketOdds.moneylineAway]);
+    pushCandidate(mlCategory, `${meta.awayTeam} ML`, 'away', pAway, 1 - pAway, 0, marketOdds.moneylineAway, undefined, [marketOdds.moneylineHome]);
   }
 
   // 2. Dynamic Spread / Handicap / Run Line / Puck Line
@@ -282,7 +357,8 @@ export function evaluateBettingValue(
       awayCoverProb,
       pushProb,
       marketOdds.spreadHomeOdds,
-      line
+      line,
+      [marketOdds.spreadAwayOdds]
     );
     pushCandidate(
       spreadCategory,
@@ -292,7 +368,8 @@ export function evaluateBettingValue(
       homeCoverProb,
       pushProb,
       marketOdds.spreadAwayOdds,
-      awayLine
+      awayLine,
+      [marketOdds.spreadHomeOdds]
     );
   }
 
@@ -310,7 +387,8 @@ export function evaluateBettingValue(
       underProb,
       pushProb,
       marketOdds.overOdds,
-      line
+      line,
+      [marketOdds.underOdds]
     );
     pushCandidate(
       totalCategory,
@@ -320,7 +398,8 @@ export function evaluateBettingValue(
       overProb,
       pushProb,
       marketOdds.underOdds,
-      line
+      line,
+      [marketOdds.overOdds]
     );
   }
 

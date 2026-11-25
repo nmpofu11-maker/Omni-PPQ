@@ -221,3 +221,62 @@ export function mutationRateLimit(config: SecurityConfig): RequestHandler {
     next();
   };
 }
+
+export interface AdminConfig {
+  /** Shared secret for privileged (model-control) endpoints. */
+  token?: string;
+  production: boolean;
+}
+
+export function resolveAdminConfig(env: NodeJS.ProcessEnv = process.env): AdminConfig {
+  return {
+    token: env.ADMIN_TOKEN?.trim() || undefined,
+    production: env.NODE_ENV === 'production',
+  };
+}
+
+function isLoopback(address: string | undefined): boolean {
+  if (!address) return false;
+  return (
+    address === '127.0.0.1' ||
+    address === '::1' ||
+    address === '::ffff:127.0.0.1'
+  );
+}
+
+/**
+ * Privileged endpoints (learning, promotion, rollback, push test). A browser
+ * session is NOT authentication here: sessionMiddleware mints one for any
+ * visitor, so a session cookie only proves the caller can make a request.
+ *
+ *  - ADMIN_TOKEN set: require `Authorization: Bearer <token>` (constant time).
+ *  - unset + production: refuse (503) rather than leave the endpoint open.
+ *  - unset + development: allow only a direct loopback connection. The check
+ *    uses the socket address, which a forwarded header cannot spoof.
+ */
+export function requireAdmin(config: AdminConfig): RequestHandler {
+  return (req, res, next) => {
+    if (config.token) {
+      const header = req.headers.authorization;
+      const presented =
+        typeof header === 'string' && header.startsWith('Bearer ')
+          ? header.slice('Bearer '.length).trim()
+          : '';
+      if (presented.length > 0 && safeEqual(presented, config.token)) {
+        next();
+        return;
+      }
+      res.status(401).json({ error: 'Admin authorization required' });
+      return;
+    }
+    if (config.production) {
+      res.status(503).json({ error: 'Admin endpoints are disabled: ADMIN_TOKEN is not configured' });
+      return;
+    }
+    if (isLoopback(req.socket.remoteAddress)) {
+      next();
+      return;
+    }
+    res.status(403).json({ error: 'Admin endpoints are limited to localhost without ADMIN_TOKEN' });
+  };
+}

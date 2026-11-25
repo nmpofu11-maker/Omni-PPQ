@@ -141,8 +141,9 @@ test('push markets store win/loss/push probabilities and EV matches them', () =>
 test('separated model, evidence, uncertainty, calibration and ranking scores', () => {
   const m = match();
   const pred = predictPureFlow(m);
-  const alerts = evaluateBettingValue(pred, verifiedLiveOdds, metaFor(m), { now: NOW });
+  const alerts = evaluateBettingValue(pred, verifiedLiveOdds, metaFor(m), { now: NOW, modelWeight: 1 });
   const a = alerts[0];
+  // With no shrinkage the priced probability is exactly the model probability.
   assert.equal(a.modelProbability, a.fairProb);
   assert.equal(a.rankingScore, a.convictionScore);
   assert.ok(a.dataQualityScore >= 0 && a.dataQualityScore <= 1);

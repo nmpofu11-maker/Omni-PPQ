@@ -1,3 +1,4 @@
+import { parseBaseballSituation } from '../src/engine/baseballState';
 import {
   LeagueInfo,
   MarketOdds,
@@ -843,6 +844,13 @@ export function parseEspnScoreboardEvent(
       awayStats,
       plays: [],
       dataQuality: 'record_prior',
+      baseState:
+        league.sport === 'baseball' && status === 'live'
+          ? parseBaseballSituation(
+              comp?.situation ?? ev?.situation,
+              `${statusObj?.type?.shortDetail ?? ''} ${statusObj?.type?.detail ?? ''} ${clockLabel}`
+            ) ?? undefined
+          : undefined,
       odds,
       hasLiveOddsNode,
     };
@@ -951,6 +959,13 @@ export function parseEspnSummary(
     awayScore: Number.isFinite(awayScore) ? awayScore : baseMatch.awayScore,
     homeRecord: homeComp?.record?.[0]?.summary || homeComp?.records?.[0]?.summary || baseMatch.homeRecord,
     awayRecord: awayComp?.record?.[0]?.summary || awayComp?.records?.[0]?.summary || baseMatch.awayRecord,
+    baseState:
+      baseMatch.sport === 'baseball' && clockParsed.status === 'live'
+        ? parseBaseballSituation(
+            headerComp?.situation ?? summaryJson?.situation,
+            `${headerComp?.status?.type?.shortDetail ?? ''} ${headerComp?.status?.type?.detail ?? ''} ${clockParsed.clockLabel}`
+          ) ?? baseMatch.baseState
+        : undefined,
     homeStats,
     awayStats,
     plays: plays.length > 0 ? plays : baseMatch.plays,

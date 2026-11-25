@@ -1,29 +1,62 @@
 import crypto from 'crypto';
 import type { SportType } from '../types/quant';
 import { computeResultChecksum, type LedgerRecord } from './ledger';
+import { temperatureScaleBinary } from './mathUtils';
 import { MODEL_VERSION, type ModelParameterOverrides } from './modelParams';
 
 /**
  * Deterministic, auditable shadow-mode learning. Candidates are estimated from
  * verified settlements only, evaluated chronologically out-of-sample, and can
  * never touch production parameters without an explicit, guarded promotion.
+ *
+ * Statistical design (each point fixes a defect found in the first version):
+ *  - Trainer and server share ONE transform (`temperatureScaleBinary`), so a
+ *    gamma learned here means exactly what it means when served.
+ *  - Training data are unconditional model-only snapshots, never the
+ *    edge-filtered alerts (selection bias / winner's curse).
+ *  - Folds split by MATCH, so two snapshots of the same match can never sit on
+ *    both sides of a train/holdout boundary.
+ *  - All reported scores (Brier AND log loss) are out-of-sample.
+ *  - Promotion requires a match-clustered significance test per sport, so a
+ *    calibrated model is not "improved" by noise.
  */
 
 export const GAMMA_GRID: readonly number[] = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3];
 
+const CALIBRATED_MARKETS = new Set<string>(['Moneyline (2-Way)', 'Match Winner (1X2)']);
+
 export interface AdaptiveSample {
   key: string;
   predictionId: string;
+  /** Cluster identity. Samples sharing a matchId are never split across folds. */
+  matchId?: string;
   sport: SportType;
   marketCategory: string;
+  /** RAW model probability of the selection (before any promoted calibration). */
   fairProb: number;
+  /** Probability the selection loses. Defaults to 1 - fairProb - pushProb. */
+  lossProb?: number;
+  pushProb?: number;
+  progressPct?: number;
   outcome: 0 | 1;
   settledAt: string;
 }
 
-export function extractVerifiedSamples(records: LedgerRecord[]): {
+export interface ExtractOptions {
+  /**
+   * Include edge-filtered (priced) alerts. Off by default: they are a
+   * selection-biased sample and must not drive calibration.
+   */
+  includePriced?: boolean;
+}
+
+export function extractVerifiedSamples(
+  records: LedgerRecord[],
+  options: ExtractOptions = {}
+): {
   samples: AdaptiveSample[];
   skipped: number;
+  excludedPriced: number;
 } {
   const predictions = new Map(
     records
@@ -32,6 +65,7 @@ export function extractVerifiedSamples(records: LedgerRecord[]): {
   );
   const samples: AdaptiveSample[] = [];
   let skipped = 0;
+  let excludedPriced = 0;
 
   for (const record of records) {
     if (record.type !== 'settlement') continue;
@@ -54,12 +88,25 @@ export function extractVerifiedSamples(records: LedgerRecord[]): {
       skipped++;
       continue;
     }
+    const kind = prediction.snapshotKind ?? 'priced';
+    if (kind !== 'model_only' && !options.includePriced) {
+      excludedPriced++;
+      continue;
+    }
+    if (!CALIBRATED_MARKETS.has(prediction.marketCategory)) {
+      skipped++;
+      continue;
+    }
     samples.push({
       key: `${settlement.predictionId}|${settlement.resultChecksum}`,
       predictionId: settlement.predictionId,
+      matchId: prediction.matchId,
       sport: prediction.sport,
       marketCategory: prediction.marketCategory,
       fairProb: Math.min(0.999, Math.max(0.001, prediction.probabilities.fairProb)),
+      lossProb: prediction.probabilities.lossProb,
+      pushProb: prediction.probabilities.pushProb,
+      progressPct: (prediction.featureSnapshot as { progressPct?: number } | undefined)?.progressPct,
       outcome: settlement.status === 'won' ? 1 : 0,
       settledAt: settlement.settledAt,
     });
@@ -68,27 +115,35 @@ export function extractVerifiedSamples(records: LedgerRecord[]): {
   samples.sort((a, b) =>
     a.settledAt === b.settledAt ? a.key.localeCompare(b.key) : a.settledAt.localeCompare(b.settledAt)
   );
-  return { samples, skipped };
+  return { samples, skipped, excludedPriced };
 }
 
-function calibratedProb(p: number, gamma: number): number {
-  return Math.min(0.999, Math.max(0.001, Math.pow(p, gamma)));
+/** P(win | not a push): the quantity a binary calibration acts on. */
+function conditionalWinProb(s: AdaptiveSample): number {
+  const push = s.pushProb ?? 0;
+  const loss = s.lossProb ?? Math.max(0, 1 - s.fairProb - push);
+  const denom = s.fairProb + loss;
+  return denom > 0 ? s.fairProb / denom : 0.5;
 }
 
-function brierScore(samples: AdaptiveSample[], gamma: number): number {
+/** The calibrated probability for a sample under `gamma`, exactly as served. */
+export function calibratedSampleProb(s: AdaptiveSample, gamma: number): number {
+  return Math.min(0.999, Math.max(0.001, temperatureScaleBinary(conditionalWinProb(s), gamma)));
+}
+
+function sqErr(s: AdaptiveSample, gamma: number): number {
+  return Math.pow(calibratedSampleProb(s, gamma) - s.outcome, 2);
+}
+
+function logErr(s: AdaptiveSample, gamma: number): number {
+  const p = calibratedSampleProb(s, gamma);
+  return -(s.outcome * Math.log(p) + (1 - s.outcome) * Math.log(1 - p));
+}
+
+function meanOf(samples: AdaptiveSample[], f: (s: AdaptiveSample) => number): number {
   if (samples.length === 0) return 0;
   let sum = 0;
-  for (const s of samples) sum += Math.pow(calibratedProb(s.fairProb, gamma) - s.outcome, 2);
-  return sum / samples.length;
-}
-
-function logLoss(samples: AdaptiveSample[], gamma: number): number {
-  if (samples.length === 0) return 0;
-  let sum = 0;
-  for (const s of samples) {
-    const p = calibratedProb(s.fairProb, gamma);
-    sum += -(s.outcome * Math.log(p) + (1 - s.outcome) * Math.log(1 - p));
-  }
+  for (const s of samples) sum += f(s);
   return sum / samples.length;
 }
 
@@ -96,7 +151,7 @@ function pickGamma(samples: AdaptiveSample[]): number {
   let best = 1;
   let bestBrier = Infinity;
   for (const gamma of GAMMA_GRID) {
-    const score = brierScore(samples, gamma);
+    const score = meanOf(samples, (s) => sqErr(s, gamma));
     if (
       score < bestBrier - 1e-12 ||
       (Math.abs(score - bestBrier) <= 1e-12 && Math.abs(gamma - 1) < Math.abs(best - 1))
@@ -109,21 +164,29 @@ function pickGamma(samples: AdaptiveSample[]): number {
 }
 
 export interface AcceptanceCriteria {
+  /** Minimum samples PER SPORT before that sport is evaluated at all. */
   minTotalSamples: number;
+  /** Minimum out-of-sample samples PER SPORT. */
   minHoldoutSamples: number;
   minBrierImprovement: number;
   maxLogLossRegression: number;
   maxFoldBrierRegression: number;
   folds: number;
+  /** Minimum distinct matches per sport (clusters). Default 150. */
+  minMatches?: number;
+  /** One-sided z threshold for the match-clustered Brier improvement. Default 2. */
+  minZ?: number;
 }
 
 export const DEFAULT_ACCEPTANCE_CRITERIA: AcceptanceCriteria = {
-  minTotalSamples: 30,
-  minHoldoutSamples: 10,
+  minTotalSamples: 300,
+  minHoldoutSamples: 100,
   minBrierImprovement: 0.001,
   maxLogLossRegression: 0.005,
   maxFoldBrierRegression: 0.02,
   folds: 4,
+  minMatches: 150,
+  minZ: 2,
 };
 
 export interface FoldEvaluation {
@@ -132,6 +195,23 @@ export interface FoldEvaluation {
   holdoutSamples: number;
   baselineBrier: number;
   candidateBrier: number;
+}
+
+export interface SportReport {
+  sport: SportType;
+  samples: number;
+  matches: number;
+  holdoutSamples: number;
+  holdoutMatches: number;
+  selectedGamma: number;
+  /** Mean out-of-sample Brier improvement (baseline - candidate). */
+  brierImprovement: number;
+  /** Match-clustered standard error of that improvement. */
+  standardError: number;
+  zScore: number;
+  logLossRegression: number;
+  passes: boolean;
+  reasons: string[];
 }
 
 export interface AdaptiveCandidate {
@@ -146,6 +226,7 @@ export interface AdaptiveCandidate {
   baselineLogLoss: number;
   candidateLogLoss: number;
   folds: FoldEvaluation[];
+  sportReports?: SportReport[];
   accepted: boolean;
   rejectionReasons: string[];
   status: 'eligible' | 'rejected';
@@ -159,15 +240,237 @@ function fingerprintOf(samples: AdaptiveSample[]): string {
     .digest('hex');
 }
 
+interface Cluster {
+  id: string;
+  at: string;
+  samples: AdaptiveSample[];
+}
+
+/** Groups snapshots by match; ordered by when the match was last settled. */
+export function groupClusters(samples: AdaptiveSample[]): Cluster[] {
+  const byId = new Map<string, Cluster>();
+  for (const s of samples) {
+    const id = s.matchId ?? s.key;
+    const existing = byId.get(id);
+    if (existing) {
+      existing.samples.push(s);
+      if (s.settledAt > existing.at) existing.at = s.settledAt;
+    } else {
+      byId.set(id, { id, at: s.settledAt, samples: [s] });
+    }
+  }
+  return [...byId.values()].sort((a, b) =>
+    a.at === b.at ? a.id.localeCompare(b.id) : a.at.localeCompare(b.at)
+  );
+}
+
 /**
- * Expanding-window walk-forward: every fold's gamma is chosen on data strictly
- * earlier than its holdout, so no future outcome informs an earlier decision.
+ * Ratio-estimator mean and cluster-robust standard error. Snapshots of one
+ * match are strongly dependent, so the unit of independence is the match.
+ */
+export function clusteredMean(
+  items: Array<{ cluster: string; d: number }>
+): { mean: number; se: number; z: number; clusters: number } {
+  const n = items.length;
+  if (n === 0) return { mean: 0, se: 0, z: 0, clusters: 0 };
+  let total = 0;
+  for (const it of items) total += it.d;
+  const mean = total / n;
+  const byCluster = new Map<string, number>();
+  for (const it of items) {
+    byCluster.set(it.cluster, (byCluster.get(it.cluster) ?? 0) + (it.d - mean));
+  }
+  const c = byCluster.size;
+  if (c < 2) return { mean, se: 0, z: 0, clusters: c };
+  let ss = 0;
+  for (const r of byCluster.values()) ss += r * r;
+  const variance = (c / (c - 1)) * (ss / (n * n));
+  const se = Math.sqrt(Math.max(0, variance));
+  const z = se > 1e-12 ? mean / se : mean > 1e-12 ? 99 : 0;
+  return { mean, se, z, clusters: c };
+}
+
+interface SportEvaluation {
+  report: SportReport;
+  folds: FoldEvaluation[];
+  baseBrierSum: number;
+  candBrierSum: number;
+  baseLogSum: number;
+  candLogSum: number;
+  holdout: number;
+}
+
+function evaluateSport(
+  sport: SportType,
+  sportSamples: AdaptiveSample[],
+  c: Required<AcceptanceCriteria>
+): SportEvaluation {
+  const clusters = groupClusters(sportSamples);
+  const reasons: string[] = [];
+  const emptyReport = (): SportReport => ({
+    sport,
+    samples: sportSamples.length,
+    matches: clusters.length,
+    holdoutSamples: 0,
+    holdoutMatches: 0,
+    selectedGamma: 1,
+    brierImprovement: 0,
+    standardError: 0,
+    zScore: 0,
+    logLossRegression: 0,
+    passes: false,
+    reasons,
+  });
+  const none = (): SportEvaluation => ({
+    report: emptyReport(),
+    folds: [],
+    baseBrierSum: 0,
+    candBrierSum: 0,
+    baseLogSum: 0,
+    candLogSum: 0,
+    holdout: 0,
+  });
+
+  if (sportSamples.length < c.minTotalSamples) {
+    reasons.push(
+      `insufficient chronological samples for ${sport}: ${sportSamples.length} < ${c.minTotalSamples}`
+    );
+  }
+  if (clusters.length < c.minMatches) {
+    reasons.push(`insufficient distinct matches for ${sport}: ${clusters.length} < ${c.minMatches}`);
+  }
+  if (reasons.length > 0) return none();
+
+  const foldCount = Math.max(2, c.folds);
+  const folds: FoldEvaluation[] = [];
+  const diffs: Array<{ cluster: string; d: number }> = [];
+  let baseBrierSum = 0;
+  let candBrierSum = 0;
+  let baseLogSum = 0;
+  let candLogSum = 0;
+  let holdout = 0;
+  let holdoutMatches = 0;
+  let worstFold = -Infinity;
+
+  for (let i = 1; i < foldCount; i++) {
+    const start = Math.floor((clusters.length * i) / foldCount);
+    const end = Math.floor((clusters.length * (i + 1)) / foldCount);
+    const train = clusters.slice(0, start).flatMap((cl) => cl.samples);
+    const holdClusters = clusters.slice(start, end);
+    const hold = holdClusters.flatMap((cl) => cl.samples);
+    if (train.length === 0 || hold.length === 0) continue;
+
+    const gamma = pickGamma(train);
+    let fb = 0;
+    let fc = 0;
+    for (const cl of holdClusters) {
+      for (const s of cl.samples) {
+        const b = sqErr(s, 1);
+        const k = sqErr(s, gamma);
+        fb += b;
+        fc += k;
+        baseLogSum += logErr(s, 1);
+        candLogSum += logErr(s, gamma);
+        diffs.push({ cluster: cl.id, d: b - k });
+      }
+    }
+    baseBrierSum += fb;
+    candBrierSum += fc;
+    holdout += hold.length;
+    holdoutMatches += holdClusters.length;
+    const foldBase = fb / hold.length;
+    const foldCand = fc / hold.length;
+    worstFold = Math.max(worstFold, foldCand - foldBase);
+    folds.push({
+      sport,
+      gamma,
+      holdoutSamples: hold.length,
+      baselineBrier: foldBase,
+      candidateBrier: foldCand,
+    });
+  }
+
+  if (holdout === 0) {
+    reasons.push(`no usable walk-forward folds for ${sport}`);
+    return none();
+  }
+
+  const stat = clusteredMean(diffs);
+  const selectedGamma = pickGamma(sportSamples);
+  const logRegression = (candLogSum - baseLogSum) / holdout;
+  const agreeing = folds.filter((f) => (f.gamma - 1) * (selectedGamma - 1) > 0).length;
+
+  if (Math.abs(selectedGamma - 1) < 1e-9) {
+    reasons.push(`no non-identity calibration candidate for ${sport}`);
+  }
+  if (holdout < c.minHoldoutSamples) {
+    reasons.push(`holdout samples ${holdout} below minimum ${c.minHoldoutSamples} for ${sport}`);
+  }
+  if (stat.mean < c.minBrierImprovement) {
+    reasons.push(
+      `out-of-sample Brier improvement ${stat.mean.toFixed(4)} below ${c.minBrierImprovement} for ${sport}`
+    );
+  }
+  if (stat.z < c.minZ) {
+    reasons.push(
+      `improvement not significant for ${sport}: match-clustered z=${stat.z.toFixed(2)} < ${c.minZ}`
+    );
+  }
+  if (logRegression > c.maxLogLossRegression + 1e-12) {
+    reasons.push(
+      `out-of-sample log-loss regression ${logRegression.toFixed(4)} exceeds ${c.maxLogLossRegression} for ${sport}`
+    );
+  }
+  if (worstFold > c.maxFoldBrierRegression + 1e-12) {
+    reasons.push(
+      `fold regression for ${sport}: ${worstFold.toFixed(4)} exceeds ${c.maxFoldBrierRegression}`
+    );
+  }
+  if (folds.length > 0 && agreeing / folds.length < 0.5) {
+    reasons.push(`unstable calibration direction across folds for ${sport}`);
+  }
+
+  return {
+    report: {
+      sport,
+      samples: sportSamples.length,
+      matches: clusters.length,
+      holdoutSamples: holdout,
+      holdoutMatches,
+      selectedGamma,
+      brierImprovement: stat.mean,
+      standardError: stat.se,
+      zScore: stat.z,
+      logLossRegression: logRegression,
+      passes: reasons.length === 0,
+      reasons,
+    },
+    folds,
+    baseBrierSum,
+    candBrierSum,
+    baseLogSum,
+    candLogSum,
+    holdout,
+  };
+}
+
+/**
+ * Expanding-window walk-forward over MATCHES: every fold's gamma is chosen on
+ * matches strictly earlier than its holdout, so no future outcome informs an
+ * earlier decision and no match straddles the boundary. Each sport is judged
+ * and promoted independently; a sport that fails never rides along with one
+ * that passes.
  */
 export function evaluateAdaptiveCandidate(
   samples: AdaptiveSample[],
   criteria: AcceptanceCriteria = DEFAULT_ACCEPTANCE_CRITERIA,
   nowIso = new Date().toISOString()
 ): AdaptiveCandidate {
+  const c: Required<AcceptanceCriteria> = {
+    minMatches: DEFAULT_ACCEPTANCE_CRITERIA.minMatches as number,
+    minZ: DEFAULT_ACCEPTANCE_CRITERIA.minZ as number,
+    ...criteria,
+  };
   const sorted = [...samples].sort((a, b) =>
     a.settledAt === b.settledAt ? a.key.localeCompare(b.key) : a.settledAt.localeCompare(b.settledAt)
   );
@@ -180,109 +483,35 @@ export function evaluateAdaptiveCandidate(
 
   const perSportGammas: Partial<Record<SportType, number>> = {};
   const folds: FoldEvaluation[] = [];
+  const sportReports: SportReport[] = [];
   const rejectionReasons: string[] = [];
   let holdoutSamples = 0;
+  let baseBrierSum = 0;
+  let candBrierSum = 0;
+  let baseLogSum = 0;
+  let candLogSum = 0;
 
-  for (const [sport, sportSamples] of bySport) {
-    if (sportSamples.length < criteria.minTotalSamples) {
-      rejectionReasons.push(`insufficient chronological samples for ${sport}`);
-      continue;
-    }
-    const foldCount = Math.max(2, criteria.folds);
-    const foldGammaCounts = new Map<number, number>();
-    let sportHoldoutBrier = 0;
-    let sportBaselineBrier = 0;
-    let sportHoldout = 0;
-
-    for (let i = 1; i < foldCount; i++) {
-      const start = Math.floor((sportSamples.length * i) / foldCount);
-      const end = Math.floor((sportSamples.length * (i + 1)) / foldCount);
-      const train = sportSamples.slice(0, start);
-      const holdout = sportSamples.slice(start, end);
-      if (train.length === 0 || holdout.length === 0) continue;
-
-      const gamma = pickGamma(train);
-      const base = brierScore(holdout, 1);
-      const candidate = brierScore(holdout, gamma);
-      folds.push({
-        sport,
-        gamma,
-        holdoutSamples: holdout.length,
-        baselineBrier: base,
-        candidateBrier: candidate,
-      });
-      foldGammaCounts.set(gamma, (foldGammaCounts.get(gamma) ?? 0) + 1);
-      if (candidate - base > criteria.maxFoldBrierRegression + 1e-12) {
-        rejectionReasons.push(
-          `fold regression for ${sport}: ${(candidate - base).toFixed(4)} exceeds ${criteria.maxFoldBrierRegression}`
-        );
-      }
-      sportHoldoutBrier += candidate * holdout.length;
-      sportBaselineBrier += base * holdout.length;
-      sportHoldout += holdout.length;
-    }
-
-    if (sportHoldout === 0) {
-      rejectionReasons.push(`no usable walk-forward folds for ${sport}`);
-      continue;
-    }
-    holdoutSamples += sportHoldout;
-
-    let selected = 1;
-    let bestCount = -1;
-    for (const gamma of GAMMA_GRID) {
-      const count = foldGammaCounts.get(gamma) ?? 0;
-      if (
-        count > bestCount ||
-        (count === bestCount && Math.abs(gamma - 1) < Math.abs(selected - 1))
-      ) {
-        selected = gamma;
-        bestCount = count;
-      }
-    }
-    if (Math.abs(selected - 1) > 1e-9) {
-      perSportGammas[sport] = selected;
+  for (const sport of [...bySport.keys()].sort()) {
+    const ev = evaluateSport(sport, bySport.get(sport) as AdaptiveSample[], c);
+    sportReports.push(ev.report);
+    folds.push(...ev.folds);
+    holdoutSamples += ev.holdout;
+    baseBrierSum += ev.baseBrierSum;
+    candBrierSum += ev.candBrierSum;
+    baseLogSum += ev.baseLogSum;
+    candLogSum += ev.candLogSum;
+    if (ev.report.passes) {
+      perSportGammas[sport] = ev.report.selectedGamma;
+    } else {
+      rejectionReasons.push(...ev.report.reasons);
     }
   }
 
-  const pooledBase = folds.length
-    ? folds.reduce((acc, f) => acc + f.baselineBrier * f.holdoutSamples, 0) /
-      folds.reduce((acc, f) => acc + f.holdoutSamples, 0)
-    : 0;
-  const pooledCandidate = folds.length
-    ? folds.reduce((acc, f) => acc + f.candidateBrier * f.holdoutSamples, 0) /
-      folds.reduce((acc, f) => acc + f.holdoutSamples, 0)
-    : 0;
-  const baseLogLoss = folds.length
-    ? sorted.reduce((acc, s) => acc + logLoss([s], 1), 0) / sorted.length
-    : 0;
-  const candidateLogLoss = folds.length
-    ? sorted.reduce((acc, s) => {
-        const gamma = perSportGammas[s.sport] ?? 1;
-        return acc + logLoss([s], gamma);
-      }, 0) / sorted.length
-    : 0;
-
-  if (Object.keys(perSportGammas).length === 0) {
+  const accepted = Object.keys(perSportGammas).length > 0;
+  if (!accepted && rejectionReasons.length === 0) {
     rejectionReasons.push('no sport produced a non-identity calibration candidate');
   }
-  if (holdoutSamples < criteria.minHoldoutSamples) {
-    rejectionReasons.push(
-      `holdout samples ${holdoutSamples} below minimum ${criteria.minHoldoutSamples}`
-    );
-  }
-  if (pooledBase - pooledCandidate < criteria.minBrierImprovement) {
-    rejectionReasons.push(
-      `out-of-sample Brier improvement ${(pooledBase - pooledCandidate).toFixed(4)} below ${criteria.minBrierImprovement}`
-    );
-  }
-  if (candidateLogLoss - baseLogLoss > criteria.maxLogLossRegression + 1e-12) {
-    rejectionReasons.push(
-      `log-loss regression ${(candidateLogLoss - baseLogLoss).toFixed(4)} exceeds ${criteria.maxLogLossRegression}`
-    );
-  }
 
-  const accepted = rejectionReasons.length === 0;
   const fingerprint = fingerprintOf(sorted);
   const gammaSignature = Object.keys(perSportGammas)
     .sort()
@@ -302,11 +531,12 @@ export function evaluateAdaptiveCandidate(
     fingerprint,
     perSportGammas,
     holdoutSamples,
-    baselineBrier: pooledBase,
-    candidateBrier: pooledCandidate,
-    baselineLogLoss: baseLogLoss,
-    candidateLogLoss,
+    baselineBrier: holdoutSamples ? baseBrierSum / holdoutSamples : 0,
+    candidateBrier: holdoutSamples ? candBrierSum / holdoutSamples : 0,
+    baselineLogLoss: holdoutSamples ? baseLogSum / holdoutSamples : 0,
+    candidateLogLoss: holdoutSamples ? candLogSum / holdoutSamples : 0,
     folds,
+    sportReports,
     accepted,
     rejectionReasons,
     status: accepted ? 'eligible' : 'rejected',
@@ -365,12 +595,19 @@ export function learnInShadow(
   options: { criteria?: AcceptanceCriteria; now?: string } = {}
 ): LearnResult {
   const now = options.now ?? new Date().toISOString();
-  const { samples } = extractVerifiedSamples(records);
+  const { samples, excludedPriced } = extractVerifiedSamples(records);
   const processed = new Set(state.processedSampleKeys);
   const fresh = samples.filter((s) => !processed.has(s.key));
 
   if (fresh.length === 0) {
-    return { state, changed: false, reason: 'no new verified settlements' };
+    return {
+      state,
+      changed: false,
+      reason:
+        samples.length === 0 && excludedPriced > 0
+          ? 'only selection-biased priced predictions are settled; no unbiased model-only snapshots to learn from'
+          : 'no new verified settlements',
+    };
   }
 
   const candidate = evaluateAdaptiveCandidate(
