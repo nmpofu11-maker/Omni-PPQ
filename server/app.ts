@@ -21,7 +21,8 @@ import {
   settlePaperBet,
 } from '../src/engine/settlementEngine';
 import {
-  appendPrediction,
+  appendPredictionsBatch,
+  buildModelOnlyPayloads,
   buildPredictionPayload,
   calibrateLedger,
   settleLedgerForMatch,
@@ -36,6 +37,7 @@ import {
   getCatalogWithDiscovered,
   scrapeMatches,
 } from './scraper';
+import { applyFinishedMatch, emptyRatingBook, getRating, type RatingBook } from '../src/engine/ratings';
 import { loadStore, saveStore, type PersistedStore } from './store';
 import { FileLedger, LedgerCorruptionError } from './ledgerStore';
 import { AdaptiveStore } from './adaptiveStore';
@@ -59,10 +61,13 @@ import {
 } from './pushService';
 import {
   mutationRateLimit,
+  requireAdmin,
   requireCsrf,
   requireSession,
+  resolveAdminConfig,
   resolveSecurityConfig,
   sessionMiddleware,
+  type AdminConfig,
   type SecurityConfig,
 } from './security';
 
@@ -99,7 +104,10 @@ export interface LedgerAdapter {
   snapshot(): {
     entries: LedgerRecord[];
     verification: LedgerVerification;
+    /** Calibration over edge-filtered (priced) alerts. Selection-biased. */
     calibration: LedgerCalibration;
+    /** Calibration over unconditional model-only snapshots (unbiased). */
+    modelCalibration?: LedgerCalibration;
   };
 }
 
@@ -129,6 +137,15 @@ export interface AppServices {
 
 export interface CreateAppOptions {
   security?: Partial<SecurityConfig>;
+  /** Privileged-endpoint auth. Defaults to ADMIN_TOKEN / NODE_ENV. */
+  admin?: Partial<AdminConfig>;
+  /**
+   * Express `trust proxy` setting (hop count, `true`, or a subnet list).
+   * Defaults to the TRUST_PROXY env var; unset means do NOT trust forwarded
+   * headers. Behind a load balancer set it, otherwise every client shares the
+   * balancer's address and therefore one rate-limit bucket.
+   */
+  trustProxy?: boolean | number | string;
   services?: Partial<AppServices>;
   now?: () => Date;
 }
@@ -190,12 +207,7 @@ function defaultServices(): AppServices {
     store: { load: loadStore, save: saveStore },
     ledger: {
       recordPredictions: (payloads) =>
-        ledger.appendRecords((existing) =>
-          payloads.reduce(
-            (records, payload) => appendPrediction(records, payload).records,
-            existing
-          )
-        ),
+        ledger.appendRecords((existing) => appendPredictionsBatch(existing, payloads).records),
       settleMatch: (match) =>
         ledger.appendRecords((existing) => settleLedgerForMatch(existing, match).records),
       snapshot: () => {
@@ -204,6 +216,7 @@ function defaultServices(): AppServices {
           entries,
           verification: verifyLedger(entries),
           calibration: calibrateLedger(entries),
+          modelCalibration: calibrateLedger(entries, 'model_only'),
         };
       },
     },
@@ -301,8 +314,23 @@ export function createApp(options: CreateAppOptions = {}): Express {
   };
   const services: AppServices = { ...defaultServices(), ...options.services };
 
+  const admin: AdminConfig = { ...resolveAdminConfig(process.env), ...options.admin };
+  const adminGuard = requireAdmin(admin);
+
   const app = express();
   app.disable('x-powered-by');
+  const trustRaw = options.trustProxy ?? process.env.TRUST_PROXY;
+  if (trustRaw !== undefined && trustRaw !== '' && trustRaw !== 'false') {
+    const trust =
+      typeof trustRaw === 'string'
+        ? /^\d+$/.test(trustRaw)
+          ? Number(trustRaw)
+          : trustRaw === 'true'
+            ? true
+            : trustRaw
+        : trustRaw;
+    app.set('trust proxy', trust);
+  }
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', sessionMiddleware(security, () => now().getTime()));
 
@@ -310,10 +338,56 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // STRICT STAGE 1 FIREWALL: odds are stripped before prediction, and only
   // explicitly promoted production parameters may reach the engines.
-  const predictFor = (match: ScrapedMatch): PureFlowPrediction =>
-    predictPureFlow(stripOddsForFirewall(match), {
+  // Team ratings are learned from finished matches and persisted inside the
+  // store under `ratings`. Cached in memory so predicting does not hit disk.
+  let ratingBook: RatingBook | null = null;
+  const currentRatings = (): RatingBook => {
+    if (!ratingBook) {
+      const raw = services.store.load().ratings as RatingBook | undefined;
+      ratingBook =
+        raw && typeof raw === 'object' && raw.teams && Array.isArray(raw.applied)
+          ? raw
+          : emptyRatingBook();
+    }
+    return ratingBook;
+  };
+  const rateFinishedMatches = (matches: ScrapedMatch[]): void => {
+    let book = currentRatings();
+    let changed = false;
+    for (const m of matches) {
+      if (m.status !== 'finished') continue;
+      const r = applyFinishedMatch(book, m);
+      if (r.changed) {
+        book = r.book;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    ratingBook = book;
+    try {
+      const store = services.store.load();
+      store.ratings = book;
+      services.store.save(store);
+    } catch (err) {
+      logFailure('ratings save', err);
+    }
+  };
+
+  const predictFor = (match: ScrapedMatch): PureFlowPrediction => {
+    const book = currentRatings();
+    const home = getRating(book, match.sport, match.homeTeam);
+    const away = getRating(book, match.sport, match.awayTeam);
+    const withRatings: ScrapedMatch = {
+      ...match,
+      homeRating: home?.rating,
+      awayRating: away?.rating,
+      homeRatingGames: home?.games,
+      awayRatingGames: away?.games,
+    };
+    return predictPureFlow(stripOddsForFirewall(withRatings), {
       params: services.adaptive.predictionOverrides(),
     });
+  };
 
   const autoSettleAgainstMatches = (matches: ScrapedMatch[]): boolean => {
     if (matches.length === 0) return false;
@@ -343,6 +417,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
     if (changed) {
       services.store.save(store);
     }
+
+    rateFinishedMatches(matches);
 
     // Mirror finished results into the immutable prediction ledger once.
     for (const m of matches) {
@@ -376,6 +452,27 @@ export function createApp(options: CreateAppOptions = {}): Express {
       services.ledger.recordPredictions(payloads);
     } catch (err) {
       logFailure('ledger record', err);
+    }
+  };
+
+  // Unconditional model snapshots (no price, no edge filter) are the unbiased
+  // sample the adaptive controller learns from. Duplicates are ignored by key.
+  const recordModelSnapshots = (
+    matches: ScrapedMatch[],
+    predictions: Record<string, PureFlowPrediction>
+  ): void => {
+    const recordedAt = now().toISOString();
+    const payloads: LedgerPredictionPayload[] = [];
+    for (const match of matches) {
+      const prediction = predictions[match.id];
+      if (!prediction) continue;
+      payloads.push(...buildModelOnlyPayloads(prediction, match, recordedAt));
+    }
+    if (payloads.length === 0) return;
+    try {
+      services.ledger.recordPredictions(payloads);
+    } catch (err) {
+      logFailure('ledger model snapshots', err);
     }
   };
 
@@ -436,6 +533,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
       // Every eligible (verified-price) prediction is logged once per price
       // snapshot, whether or not the user ever places a bet.
       recordEligiblePredictions(filteredMatches, allAlerts, predictions);
+      recordModelSnapshots(filteredMatches, predictions);
 
       // Dispatch background Web Push for #1 Best Bet if qualified
       if (bestBet && bestBet.oddsVerifiedLive) {
@@ -515,6 +613,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
       }
 
       recordEligiblePredictions(matches, allAlerts, predictions);
+      recordModelSnapshots(matches, predictions);
       const ranked = rankBestBets(allAlerts);
       res.json({ bestBet: ranked[0] ?? null, alerts: ranked, verifiedLiveOnly });
     } catch (err) {
@@ -551,7 +650,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     }
   });
 
-  app.post('/api/adaptive/learn', ...mutationGuard, (_req, res) => {
+  app.post('/api/adaptive/learn', ...mutationGuard, adminGuard, (_req, res) => {
     try {
       const { entries } = services.ledger.snapshot();
       const result = services.adaptive.learn(entries, now().toISOString());
@@ -571,7 +670,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     }
   });
 
-  app.post('/api/adaptive/promote', ...mutationGuard, (req, res) => {
+  app.post('/api/adaptive/promote', ...mutationGuard, adminGuard, (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const candidateId = typeof body.candidateId === 'string' ? body.candidateId : '';
     if (!/^[a-f0-9]{16}$/.test(candidateId)) {
@@ -603,7 +702,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     }
   });
 
-  app.post('/api/adaptive/rollback', ...mutationGuard, (_req, res) => {
+  app.post('/api/adaptive/rollback', ...mutationGuard, adminGuard, (_req, res) => {
     try {
       const result = services.adaptive.rollback({
         actor: 'operator',
@@ -659,12 +758,6 @@ export function createApp(options: CreateAppOptions = {}): Express {
         (line !== undefined && !Number.isFinite(line))
       ) {
         res.status(400).json({ error: 'Invalid paper bet payload' });
-        return;
-      }
-
-      const store = services.store.load();
-      if (stakeAmount > store.bankroll) {
-        res.status(400).json({ error: 'Insufficient paper bankroll for stake' });
         return;
       }
 
@@ -734,6 +827,14 @@ export function createApp(options: CreateAppOptions = {}): Express {
         pnl: 0,
       };
 
+      // The store is re-read AFTER every await and mutated in one synchronous
+      // block. Loading before the network calls and saving after them let two
+      // concurrent requests overwrite each other (lost bet, wrong bankroll).
+      const store = services.store.load();
+      if (bet.stakeAmount > store.bankroll) {
+        res.status(400).json({ error: 'Insufficient paper bankroll for stake' });
+        return;
+      }
       store.bankroll = round2(store.bankroll - bet.stakeAmount);
       store.bets.unshift(bet);
       services.store.save(store);
@@ -752,44 +853,62 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   app.post('/api/bets/settle', ...mutationGuard, async (_req, res) => {
     try {
-      const store = services.store.load();
-      const pendingBets = store.bets.filter((b) => b.status === 'pending');
-      let settledCount = 0;
-
-      for (let i = 0; i < store.bets.length; i++) {
-        const bet = store.bets[i];
-        if (bet.status !== 'pending') continue;
+      // Phase 1 (async): look up final results. No store state is held across
+      // these awaits.
+      const pendingMatchIds = [
+        ...new Set(
+          services.store
+            .load()
+            .bets.filter((b) => b.status === 'pending')
+            .map((b) => b.matchId)
+        ),
+      ];
+      const finished = new Map<string, ScrapedMatch>();
+      for (const matchId of pendingMatchIds) {
         try {
-          const m = await services.fetchMatchSummary(bet.matchId);
+          const m = await services.fetchMatchSummary(matchId);
           if (m.status !== 'finished') continue;
+          finished.set(matchId, m);
+          rateFinishedMatches([m]);
           try {
             services.ledger.settleMatch(m);
           } catch (err) {
             logFailure('ledger settle', err);
-          }
-          const settled = settlePaperBet(bet, {
-            status: m.status,
-            homeScore: m.homeScore,
-            awayScore: m.awayScore,
-            homeLinescores: m.homeStats.linescores,
-            awayLinescores: m.awayStats.linescores,
-          });
-          if (settled.status !== 'pending') {
-            store.bets[i] = settled;
-            store.bankroll = round2(store.bankroll + settled.stakeAmount + settled.pnl);
-            settledCount++;
           }
         } catch {
           // Skip matches unavailable on the upstream summary feed.
         }
       }
 
+      // Phase 2 (sync): re-read the CURRENT store, apply results, save. Bets
+      // placed or deleted while phase 1 was awaiting are preserved.
+      const store = services.store.load();
+      const checked = store.bets.filter((b) => b.status === 'pending').length;
+      let settledCount = 0;
+      for (let i = 0; i < store.bets.length; i++) {
+        const bet = store.bets[i];
+        if (bet.status !== 'pending') continue;
+        const m = finished.get(bet.matchId);
+        if (!m) continue;
+        const settled = settlePaperBet(bet, {
+          status: m.status,
+          homeScore: m.homeScore,
+          awayScore: m.awayScore,
+          homeLinescores: m.homeStats.linescores,
+          awayLinescores: m.awayStats.linescores,
+        });
+        if (settled.status !== 'pending') {
+          store.bets[i] = settled;
+          store.bankroll = round2(store.bankroll + settled.stakeAmount + settled.pnl);
+          settledCount++;
+        }
+      }
       if (settledCount > 0) {
         services.store.save(store);
       }
 
       res.json({
-        checked: pendingBets.length,
+        checked,
         settledCount,
         bankroll: store.bankroll,
         bets: store.bets,
@@ -866,7 +985,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     res.json({ ok: true, subscribers: services.push.subscriptionCount() });
   });
 
-  app.post('/api/push/test', ...mutationGuard, async (_req, res) => {
+  app.post('/api/push/test', ...mutationGuard, adminGuard, async (_req, res) => {
     try {
       const result = await services.push.sendTest();
       res.json(result);

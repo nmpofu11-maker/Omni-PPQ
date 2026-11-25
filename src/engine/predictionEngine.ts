@@ -1,3 +1,6 @@
+import { ratingImpliedHomeProb } from './ratings';
+import { baseballRemainingRuns } from './baseballState';
+import { footballMarginTail } from './footballKeyNumbers';
 import {
   OddsFreeMatchSnapshot,
   PureFlowPrediction,
@@ -7,7 +10,9 @@ import {
   clamp,
   normalCdf,
   parseRecordWinPct,
+  recordFormatForSport,
   poissonPmf,
+  temperatureScaleBinary,
 } from './mathUtils';
 import { assessEvidence, evidenceConfidence } from './evidence';
 import { buildMomentumSeries, computeRecencyFlowScore } from './momentum';
@@ -52,6 +57,11 @@ export function stripOddsForFirewall(
     awayScore: match.awayScore,
     homeRecord: match.homeRecord,
     awayRecord: match.awayRecord,
+    baseState: match.baseState ? { ...match.baseState } : undefined,
+    homeRating: match.homeRating,
+    awayRating: match.awayRating,
+    homeRatingGames: match.homeRatingGames,
+    awayRatingGames: match.awayRatingGames,
     homeStats: { ...match.homeStats },
     awayStats: { ...match.awayStats },
     plays: Array.isArray(match.plays) ? match.plays.map((p) => ({ ...p })) : [],
@@ -62,24 +72,52 @@ export function stripOddsForFirewall(
   };
 }
 
-function getRecordAdvantage(homeRecord?: string, awayRecord?: string): {
+const RATING_FULL_TRUST_GAMES = 20;
+
+function getRecordAdvantage(
+  homeRecord?: string,
+  awayRecord?: string,
+  sport?: string,
+  ratings?: { home?: number; away?: number; homeGames?: number; awayGames?: number }
+): {
   homeStrength: number; // centered around 0.5
   awayStrength: number;
   diffPrior: number; // [-0.35, +0.35]
 } {
-  const h = parseRecordWinPct(homeRecord);
-  const a = parseRecordWinPct(awayRecord);
+  const fmt = recordFormatForSport(sport);
+  const h = parseRecordWinPct(homeRecord, fmt);
+  const a = parseRecordWinPct(awayRecord, fmt);
   const hPct = h ? h.winPct : 0.53; // slight home field/court prior when unknown
   const aPct = a ? a.winPct : 0.47;
   // Log5 / Bradley-Terry relative strength
   const denom = hPct * (1 - aPct) + (1 - hPct) * aPct;
   const homeWinPrior = denom > 0 ? (hPct * (1 - aPct)) / denom : 0.53;
   // Blend slight home advantage
-  const adjustedHome = clamp(homeWinPrior * 0.92 + 0.54 * 0.08, 0.15, 0.85);
+  let adjustedHome = clamp(homeWinPrior * 0.92 + 0.54 * 0.08, 0.15, 0.85);
+
+  // Opponent-adjusted Elo prior, trusted in proportion to the games behind it.
+  const eloP =
+    sport !== undefined
+      ? ratingImpliedHomeProb(sport, ratings?.home, ratings?.away)
+      : null;
+  if (eloP !== null) {
+    const games = Math.min(ratings?.homeGames ?? 0, ratings?.awayGames ?? 0);
+    const w = clamp(games / RATING_FULL_TRUST_GAMES, 0, 1) * 0.7;
+    adjustedHome = clamp(adjustedHome * (1 - w) + eloP * w, 0.12, 0.88);
+  }
   return {
     homeStrength: adjustedHome,
     awayStrength: 1 - adjustedHome,
     diffPrior: adjustedHome - 0.5,
+  };
+}
+
+function ratingsOf(snapshot: OddsFreeMatchSnapshot) {
+  return {
+    home: snapshot.homeRating,
+    away: snapshot.awayRating,
+    homeGames: snapshot.homeRatingGames,
+    awayGames: snapshot.awayRatingGames,
   };
 }
 
@@ -283,6 +321,18 @@ export function evaluateSpreadLine(
 
   // Home covers when FinalMargin > -spreadHomeLine
   const targetMargin = -spreadHomeLine;
+
+  if (prediction.sport === 'football') {
+    // Lumpy 3/7 margins: discrete pmf with key-number mass, fading as the game is played.
+    const lump = clamp(1 - prediction.progressPct, 0, 1);
+    const t = footballMarginTail(meanMargin, stdMargin, lump, targetMargin);
+    return {
+      homeCoverProb: clamp(t.above, 0.01, 0.99),
+      awayCoverProb: clamp(t.below, 0.01, 0.99),
+      pushProb: clamp(t.equal, 0, 1),
+    };
+  }
+
   const isIntegerLine = Math.abs(spreadHomeLine - Math.round(spreadHomeLine)) < 1e-6;
   if (isIntegerLine) {
     const awayCoverProb = normalCdf((targetMargin - 0.5 - meanMargin) / stdMargin);
@@ -311,7 +361,7 @@ function predictSoccer(
   const rem = Math.max(0, 1 - p);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
@@ -471,7 +521,7 @@ function predictBasketball(
   const rem = Math.max(0, 1 - p);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
   const regMinutes = snapshot.regulationMinutes ?? (snapshot.league.includes('nba') ? 48 : 40);
   const isNba = snapshot.league.includes('nba');
   const priorTeamTotal = isNba ? params.nbaTeamTotal : params.otherTeamTotal;
@@ -499,9 +549,20 @@ function predictBasketball(
   const aReb = a.rebounds ?? 0;
 
   const hasBox = evidence.homeBox !== 'none' && evidence.awayBox !== 'none';
-  const effEdge = hasBox
-    ? (hFg - aFg) * 0.28 + (h3p - a3p) * 0.14 + (aTo - hTo) * 0.45 + (hReb - aReb) * 0.16
+  // Box-score telemetry is CUMULATIVE for the game so far, and its effect is
+  // already inside the scoreboard margin. Counting it again at face value (as
+  // the old code did) double counts, and the cumulative TO/REB differences grow
+  // with elapsed time. Here: (1) count differentials become full-game RATES,
+  // (2) the whole edge is shrunk by an evidence weight that is small early in
+  // the game, and (3) it only acts on the REMAINING game (see below).
+  const rateScale = 1 / Math.max(0.15, p);
+  const rawEdge = hasBox
+    ? (hFg - aFg) * 0.28 +
+      (h3p - a3p) * 0.14 +
+      ((aTo - hTo) * 0.45 + (hReb - aReb) * 0.16) * rateScale
     : 0;
+  const edgeEvidenceWeight = p / (p + 0.35);
+  const effEdge = clamp(rawEdge * edgeEvidenceWeight, -6, 6);
 
   // Play-by-play recent scoring run momentum
   const flow = computeRecencyFlowScore(snapshot.plays, {
@@ -608,7 +669,7 @@ function predictFootball(
   const rem = Math.max(0, 1 - p);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
@@ -629,9 +690,15 @@ function predictFootball(
   const h3rd = h.thirdDownPct ?? 40;
   const a3rd = a.thirdDownPct ?? 40;
 
-  const yardEdge = hasBox
-    ? (hYards - aYards) * 0.032 + (h1st - a1st) * 0.42 + (aTo - hTo) * 2.6 + (h3rd - a3rd) * 0.06
+  // Cumulative box-score differentials are already reflected in the score.
+  // Convert counts to full-game rates and shrink by an evidence weight so the
+  // same effect is not counted twice (see basketball for the rationale).
+  const fbRateScale = 1 / Math.max(0.15, p);
+  const rawYardEdge = hasBox
+    ? ((hYards - aYards) * 0.032 + (h1st - a1st) * 0.42 + (aTo - hTo) * 2.6) * fbRateScale +
+      (h3rd - a3rd) * 0.06
     : 0;
+  const yardEdge = clamp(rawYardEdge * (p / (p + 0.35)), -9, 9);
 
   const flow = computeRecencyFlowScore(snapshot.plays, {
     currentElapsedMinutes: p * 60,
@@ -738,7 +805,7 @@ function predictHockey(
   const rem = Math.max(0, 1 - p);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
@@ -867,7 +934,7 @@ function predictBaseball(
   const rem = Math.max(0, 1 - p);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
 
   const h = snapshot.homeStats;
   const a = snapshot.awayStats;
@@ -913,6 +980,23 @@ function predictBaseball(
 
   let homeLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedHome9 * rem;
   let awayLambdaRem = snapshot.status === 'finished' || rem <= 0 ? 0.0001 : blendedAway9 * rem;
+
+  // Base-out state: replaces the progress-fraction guess for the current
+  // half-inning with run expectancy for the actual runners/outs.
+  let usedBaseState = false;
+  if (snapshot.status === 'live' && snapshot.baseState) {
+    const bs = baseballRemainingRuns({
+      inning: snapshot.period,
+      state: snapshot.baseState,
+      homeRate9: blendedHome9,
+      awayRate9: blendedAway9,
+    });
+    if (bs) {
+      homeLambdaRem = Math.max(0.0001, bs.homeLambda);
+      awayLambdaRem = Math.max(0.0001, bs.awayLambda);
+      usedBaseState = true;
+    }
+  }
 
   // Bottom of the 9th (or later) with the home side ahead: the home team does
   // not bat again and the game cannot be lost, so remaining at-bats are zero.
@@ -978,7 +1062,7 @@ function predictBaseball(
     confidence: evidenceConfidence(evidence),
     modelNotes: [
       `9-inning run projection: ${blendedHome9.toFixed(2)} vs ${blendedAway9.toFixed(2)}`,
-      `Remaining Poisson λ: (${homeLambdaRem.toFixed(2)}, ${awayLambdaRem.toFixed(2)})`,
+      `Remaining Poisson λ: (${homeLambdaRem.toFixed(2)}, ${awayLambdaRem.toFixed(2)})${usedBaseState ? ' [base-out state]' : ''}`,
     ],
   };
 
@@ -1050,7 +1134,7 @@ function predictTennis(
   const p = clamp(snapshot.progressPct, 0, 1);
   const evidence = assessEvidence(snapshot);
   const tier = evidence.tier;
-  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord);
+  const { diffPrior } = getRecordAdvantage(snapshot.homeRecord, snapshot.awayRecord, snapshot.sport, ratingsOf(snapshot));
   const setsToWin: 2 | 3 = snapshot.bestOfSets === 5 ? 3 : 2;
 
   const hSetsArr = snapshot.homeStats.linescores ?? [];
@@ -1244,8 +1328,19 @@ export interface PredictOptions {
  * can never read bookmaker prices.
  */
 /**
- * Applies an out-of-sample probability calibration gamma: p' = p^gamma
- * renormalized inside each mutually exclusive market. Push mass is preserved.
+ * Applies an out-of-sample temperature calibration (gamma) to the outright
+ * result probabilities (home / draw / away, DNB and next-goal pairs).
+ *
+ * Each outcome is scaled with the SAME binary transform the trainer scores
+ * (`temperatureScaleBinary`, one-vs-rest) and a mutually exclusive set is then
+ * renormalised so it still sums to 1. For two-way markets this is exactly
+ * sigma(gamma * logit p).
+ *
+ * Totals and spreads are deliberately left untouched: gamma is learned from
+ * moneyline outcomes only, so it says nothing about those distributions (and
+ * the value engine prices them from the model parameters directly). The raw
+ * probabilities are preserved on `uncalibratedFairProbs` so the learner never
+ * trains on its own output.
  */
 export function applyProbabilityCalibration(
   prediction: PureFlowPrediction,
@@ -1254,17 +1349,22 @@ export function applyProbabilityCalibration(
   if (!Number.isFinite(gamma) || gamma <= 0 || Math.abs(gamma - 1) < 1e-9) {
     return prediction;
   }
-  const pow = (p: number) =>
-    Math.pow(Math.max(0, Math.min(1, Number.isFinite(p) ? p : 0)), gamma);
+  const scale = (p: number) => temperatureScaleBinary(Number.isFinite(p) ? p : 0, gamma);
+
+  const raw = prediction.uncalibratedFairProbs ?? {
+    homeWin: prediction.fairProbs.homeWin,
+    draw: prediction.fairProbs.draw,
+    awayWin: prediction.fairProbs.awayWin,
+  };
 
   const fairProbs = { ...prediction.fairProbs };
   const trio = ['homeWin', 'draw', 'awayWin'] as const;
   const present = trio.filter((key) => Number.isFinite(fairProbs[key] as number));
-  const trioSum = present.reduce((acc, key) => acc + pow(fairProbs[key] as number), 0);
+  const trioSum = present.reduce((acc, key) => acc + scale(fairProbs[key] as number), 0);
   if (trioSum > 0) {
     for (const key of present) {
       (fairProbs as Record<string, number | undefined>)[key] =
-        pow(fairProbs[key] as number) / trioSum;
+        scale(fairProbs[key] as number) / trioSum;
     }
   }
 
@@ -1276,8 +1376,8 @@ export function applyProbabilityCalibration(
     const pa = fairProbs[a];
     const pb = fairProbs[b];
     if (Number.isFinite(pa) && Number.isFinite(pb)) {
-      const sa = pow(pa as number);
-      const sb = pow(pb as number);
+      const sa = scale(pa as number);
+      const sb = scale(pb as number);
       if (sa + sb > 0) {
         (fairProbs as Record<string, number | undefined>)[a] = sa / (sa + sb);
         (fairProbs as Record<string, number | undefined>)[b] = sb / (sa + sb);
@@ -1285,35 +1385,10 @@ export function applyProbabilityCalibration(
     }
   }
 
-  const standardLines = {
-    totalLines: prediction.standardLines.totalLines.map((line) => {
-      const base = line.overProb + line.underProb;
-      const sa = pow(line.overProb);
-      const sb = pow(line.underProb);
-      if (sa + sb <= 0) return line;
-      return {
-        ...line,
-        overProb: (sa / (sa + sb)) * base,
-        underProb: (sb / (sa + sb)) * base,
-      };
-    }),
-    spreadLines: prediction.standardLines.spreadLines.map((line) => {
-      const base = line.homeCoverProb + line.awayCoverProb;
-      const sa = pow(line.homeCoverProb);
-      const sb = pow(line.awayCoverProb);
-      if (sa + sb <= 0) return line;
-      return {
-        ...line,
-        homeCoverProb: (sa / (sa + sb)) * base,
-        awayCoverProb: (sb / (sa + sb)) * base,
-      };
-    }),
-  };
-
   return {
     ...prediction,
     fairProbs,
-    standardLines,
+    uncalibratedFairProbs: raw,
     parameterVersion: `${prediction.parameterVersion}-cal${gamma}`,
     modelNotes: [
       ...prediction.modelNotes,

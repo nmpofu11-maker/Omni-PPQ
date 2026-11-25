@@ -160,6 +160,13 @@ export interface OddsFreeMatchSnapshot {
   awayStats: TeamTelemetry;
   plays: PlayEvent[];
   dataQuality: DataQualityTier;
+  /** Baseball only: live base-out state, when the feed provides it. */
+  baseState?: { outs: number; first: boolean; second: boolean; third: boolean; half: 'top' | 'bottom' };
+  /** Optional pre-game team strength ratings (Elo-style, 1500 = average). */
+  homeRating?: number;
+  awayRating?: number;
+  homeRatingGames?: number;
+  awayRatingGames?: number;
   bbcVerifiedScore?: {
     homeScore: number;
     awayScore: number;
@@ -180,6 +187,16 @@ export interface PureFlowPrediction {
   parameterVersion: string;
   evidence: EvidenceSummary;
   progressPct: number;
+  /**
+   * Present only when a promoted calibration was applied: the raw model
+   * probabilities BEFORE calibration. The learner must train on these, never on
+   * `fairProbs`, or a promoted calibration would be re-fitted on top of itself.
+   */
+  uncalibratedFairProbs?: {
+    homeWin: number;
+    draw?: number;
+    awayWin: number;
+  };
   fairProbs: {
     homeWin: number;
     draw?: number;

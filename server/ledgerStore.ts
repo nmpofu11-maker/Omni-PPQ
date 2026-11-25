@@ -18,6 +18,12 @@ export interface LedgerStoreOptions {
 export class FileLedger {
   private readonly dataDir: string;
   private readonly file: string;
+  /**
+   * Parsed + hash-chain-verified records for the file as last seen. Every poll
+   * reads the ledger; without this each request re-parsed and re-hashed the
+   * entire history. Invalidated by any change to the file's size or mtime.
+   */
+  private cache: { mtimeMs: number; size: number; records: LedgerRecord[] } | null = null;
 
   constructor(options: LedgerStoreOptions = {}) {
     this.dataDir = path.resolve(options.dataDir ?? path.resolve(process.cwd(), 'data'));
@@ -29,7 +35,19 @@ export class FileLedger {
   }
 
   read(): LedgerRecord[] {
-    if (!fs.existsSync(this.file)) return [];
+    if (!fs.existsSync(this.file)) {
+      this.cache = null;
+      return [];
+    }
+    const stat = fs.statSync(this.file);
+    if (
+      this.cache &&
+      this.cache.mtimeMs === stat.mtimeMs &&
+      this.cache.size === stat.size
+    ) {
+      return this.cache.records;
+    }
+    this.cache = null;
     const lines = fs
       .readFileSync(this.file, 'utf-8')
       .split(/\r?\n/)
@@ -52,6 +70,7 @@ export class FileLedger {
         `${verdict.reason}; file left untouched at ${this.file}`
       );
     }
+    this.cache = { mtimeMs: stat.mtimeMs, size: stat.size, records };
     return records;
   }
 
@@ -74,6 +93,8 @@ export class FileLedger {
       );
     }
     writeFileAtomic(this.file, `${next.map((r) => JSON.stringify(r)).join('\n')}\n`);
+    const written = fs.statSync(this.file);
+    this.cache = { mtimeMs: written.mtimeMs, size: written.size, records: next };
     return delta;
   }
 }

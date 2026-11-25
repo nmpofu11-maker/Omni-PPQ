@@ -18,6 +18,15 @@ export const GENESIS_HASH = '0'.repeat(64);
 export interface LedgerPredictionPayload {
   /** Deduplication identity for one observed price snapshot of one prediction. */
   snapshotKey: string;
+  /**
+   * 'priced' (default, also for legacy records): an alert that passed the edge
+   * filter against a verified price. 'model_only': an unconditional snapshot of
+   * the model's own outcome probability, recorded regardless of price or edge.
+   * Only model_only snapshots are an unbiased sample for calibration learning.
+   */
+  snapshotKind?: 'priced' | 'model_only';
+  /** model_only: progress decile (0-9), or -1 before kickoff. */
+  progressBucket?: number;
   predictionId: string;
   matchId: string;
   sport: SportType;
@@ -34,6 +43,10 @@ export interface LedgerPredictionPayload {
   line?: number;
   recordedAt: string;
   probabilities: {
+    /**
+     * priced: the served (possibly calibrated) probability.
+     * model_only: the RAW model probability before any promoted calibration.
+     */
     fairProb: number;
     lossProb: number;
     pushProb: number;
@@ -176,6 +189,122 @@ export function buildPredictionPayload(
   };
 }
 
+const MODEL_ONLY_MIN_PROB = 0.001;
+
+export function progressBucketOf(status: MatchStatus, progressPct: number): number {
+  if (status === 'upcoming') return -1;
+  const p = Number.isFinite(progressPct) ? Math.max(0, Math.min(1, progressPct)) : 0;
+  return Math.min(9, Math.floor(p * 10));
+}
+
+/**
+ * Unconditional model snapshots for calibration learning. They are written for
+ * every live/upcoming match regardless of price or edge, so the learner sees
+ * the model's whole prediction distribution instead of only the cases where it
+ * disagreed with the market (a selection-biased, winner's-curse sample).
+ *
+ * Two-way sports record only the home outcome: the away outcome is its exact
+ * complement and adds no information under a symmetric calibration. Soccer
+ * records home/draw/away.
+ */
+export function buildModelOnlyPayloads(
+  prediction: PureFlowPrediction,
+  match: ScrapedMatch,
+  recordedAt: string
+): LedgerPredictionPayload[] {
+  if (match.status === 'finished') return [];
+  if (prediction.evidence && prediction.evidence.identityValid === false) return [];
+
+  const raw = prediction.uncalibratedFairProbs ?? prediction.fairProbs;
+  const served = prediction.fairProbs;
+  const bucket = progressBucketOf(match.status, match.progressPct);
+  const isSoccer = match.sport === 'soccer';
+  const marketCategory: MarketCategory = isSoccer ? 'Match Winner (1X2)' : 'Moneyline (2-Way)';
+
+  const outcomes: Array<{ side: 'home' | 'draw' | 'away'; selection: string; key: 'homeWin' | 'draw' | 'awayWin' }> =
+    isSoccer
+      ? [
+          { side: 'home', selection: `${match.homeTeam} Win`, key: 'homeWin' },
+          { side: 'draw', selection: 'Draw', key: 'draw' },
+          { side: 'away', selection: `${match.awayTeam} Win`, key: 'awayWin' },
+        ]
+      : [{ side: 'home', selection: `${match.homeTeam} ML`, key: 'homeWin' }];
+
+  const payloads: LedgerPredictionPayload[] = [];
+  for (const o of outcomes) {
+    const p = raw[o.key];
+    if (typeof p !== 'number' || !Number.isFinite(p)) continue;
+    const win = Math.min(1 - MODEL_ONLY_MIN_PROB, Math.max(MODEL_ONLY_MIN_PROB, p));
+    const predictionId = `${match.id}::model::${marketCategory}::${o.side}::b${bucket}`;
+    const servedP = served[o.key];
+    payloads.push({
+      snapshotKey: `${predictionId}|model_only`,
+      snapshotKind: 'model_only',
+      progressBucket: bucket,
+      predictionId,
+      matchId: match.id,
+      sport: match.sport,
+      sportPath: match.sportPath,
+      league: match.league,
+      leagueName: match.leagueName,
+      homeTeam: match.homeTeam,
+      awayTeam: match.awayTeam,
+      clockLabel: match.clockLabel,
+      status: match.status,
+      marketCategory,
+      selection: o.selection,
+      side: o.side,
+      recordedAt,
+      probabilities: {
+        fairProb: Math.round(win * 10000) / 10000,
+        lossProb: Math.round((1 - win) * 10000) / 10000,
+        pushProb: 0,
+        fairOdds: Math.round((1 / win) * 100) / 100,
+        modelProbability:
+          typeof servedP === 'number' && Number.isFinite(servedP)
+            ? Math.round(servedP * 10000) / 10000
+            : Math.round(win * 10000) / 10000,
+        impliedProb: 0,
+      },
+      pricing: {
+        bookmakerOdds: 0,
+        evPct: 0,
+        kellyQuarterStakePct: 0,
+        oddsVerifiedLive: false,
+        priceVerified: false,
+        priceKind: 'unknown',
+      },
+      evidence: {
+        dataQuality: prediction.dataQuality,
+        dataQualityScore: 0,
+        uncertaintyScore: Math.round((1 - prediction.confidence) * 10000) / 10000,
+        calibrationScore: 1,
+        convictionScore: 0,
+        rankingScore: 0,
+        evidence: prediction.evidence,
+      },
+      model: {
+        modelVersion: prediction.modelVersion,
+        parameterVersion: prediction.parameterVersion,
+      },
+      featureSnapshot: {
+        homeScore: match.homeScore,
+        awayScore: match.awayScore,
+        period: match.period,
+        progressPct: match.progressPct,
+        regulationMinutes: match.regulationMinutes,
+        clockLabel: match.clockLabel,
+        homeRecord: match.homeRecord,
+        awayRecord: match.awayRecord,
+        homeStats: { ...match.homeStats },
+        awayStats: { ...match.awayStats },
+        dataQuality: match.dataQuality,
+      },
+    });
+  }
+  return payloads;
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -247,6 +376,36 @@ export function appendPrediction(
     records: withRecord(records, { type: 'prediction', recordedAt, payload }),
     appended: true,
   };
+}
+
+/**
+ * Appends many predictions in one pass. Equivalent to folding appendPrediction
+ * but O(n + m) instead of O(n * m) with an array copy per record.
+ */
+export function appendPredictionsBatch(
+  records: LedgerRecord[],
+  payloads: LedgerPredictionPayload[]
+): { records: LedgerRecord[]; appended: number } {
+  const known = new Set<string>();
+  for (const r of records) {
+    if (r.type === 'prediction') known.add(r.payload.snapshotKey);
+  }
+  let out: LedgerRecord[] | null = null;
+  let prevHash = lastHash(records);
+  let seq = records.length;
+  let appended = 0;
+  for (const payload of payloads) {
+    if (known.has(payload.snapshotKey)) continue;
+    known.add(payload.snapshotKey);
+    if (!out) out = records.slice();
+    seq += 1;
+    const recordedAt = payload.recordedAt;
+    const hash = computeRecordHash(prevHash, seq, recordedAt, 'prediction', payload);
+    out.push({ seq, recordedAt, prevHash, hash, type: 'prediction', payload } as LedgerRecord);
+    prevHash = hash;
+    appended++;
+  }
+  return { records: out ?? records, appended };
 }
 
 export function appendSettlement(
@@ -434,14 +593,19 @@ export interface LedgerCalibration {
  * Push/void outcomes carry no directional information, so they are excluded
  * from Brier and log-loss scoring while still counted as settled.
  */
-export function calibrateLedger(records: LedgerRecord[]): LedgerCalibration {
+export function calibrateLedger(
+  records: LedgerRecord[],
+  kind: 'priced' | 'model_only' = 'priced'
+): LedgerCalibration {
   const predictions = records.filter(
-    (r): r is LedgerPredictionRecord => r.type === 'prediction'
-  );
-  const settlements = records.filter(
-    (r): r is LedgerSettlementRecord => r.type === 'settlement'
+    (r): r is LedgerPredictionRecord =>
+      r.type === 'prediction' && (r.payload.snapshotKind ?? 'priced') === kind
   );
   const byId = new Map(predictions.map((r) => [r.payload.predictionId, r.payload]));
+  const settlements = records.filter(
+    (r): r is LedgerSettlementRecord =>
+      r.type === 'settlement' && byId.has(r.payload.predictionId)
+  );
 
   let decisive = 0;
   let pushes = 0;

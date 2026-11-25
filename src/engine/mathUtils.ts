@@ -1,5 +1,12 @@
+/**
+ * Clamp into [min, max]. A non-finite input (NaN/Infinity from bad upstream
+ * data) maps to the midpoint of the range, i.e. a neutral value, rather than
+ * silently to `min` (which would turn a missing probability into 1% and a
+ * missing rate into the floor). Money paths must guard non-finite inputs
+ * themselves and return 0 instead of relying on this.
+ */
 export function clamp(val: number, min: number, max: number): number {
-  if (!Number.isFinite(val)) return min;
+  if (!Number.isFinite(val)) return (min + max) / 2;
   return Math.max(min, Math.min(max, val));
 }
 
@@ -48,7 +55,21 @@ export function poissonCdf(kMax: number, lambda: number): number {
   return clamp(sum, 0, 1);
 }
 
-export function parseRecordWinPct(record?: string): {
+/**
+ * Record layouts differ by sport:
+ *  - soccer: W-D-L (the middle number is DRAWS, not losses)
+ *  - hockey: W-L-OTL (third number is overtime losses, which are losses)
+ *  - everything else: W-L or W-L-T (third number is ties, worth half a win)
+ */
+export type RecordFormat = 'wlt' | 'wdl' | 'wlotl';
+
+export function recordFormatForSport(sport?: string): RecordFormat {
+  if (sport === 'soccer') return 'wdl';
+  if (sport === 'hockey') return 'wlotl';
+  return 'wlt';
+}
+
+export function parseRecordWinPct(record?: string, format: RecordFormat = 'wlt'): {
   wins: number;
   losses: number;
   ties: number;
@@ -58,9 +79,20 @@ export function parseRecordWinPct(record?: string): {
   if (!record || typeof record !== 'string') return null;
   const match = record.trim().match(/^(\d+)-(\d+)(?:-(\d+))?/);
   if (!match) return null;
-  const wins = Number.parseInt(match[1], 10);
-  const losses = Number.parseInt(match[2], 10);
-  const ties = match[3] ? Number.parseInt(match[3], 10) : 0;
+  const a = Number.parseInt(match[1], 10);
+  const b = Number.parseInt(match[2], 10);
+  const c = match[3] ? Number.parseInt(match[3], 10) : 0;
+  let wins = a;
+  let losses = b;
+  let ties = c;
+  if (format === 'wdl' && match[3] !== undefined) {
+    wins = a;
+    ties = b; // draws
+    losses = c;
+  } else if (format === 'wlotl') {
+    losses = b + c; // OT losses are losses
+    ties = 0;
+  }
   const games = wins + losses + ties;
   if (games <= 0) return null;
   // Bayesian Laplace smoothing towards 0.50 with pseudo-count 4 games
@@ -107,8 +139,29 @@ export function kellyFraction(
   decimalOdds: number
 ): number {
   if (!Number.isFinite(decimalOdds) || decimalOdds <= 1.01) return 0;
+  if (!Number.isFinite(winProb) || !Number.isFinite(lossProb)) return 0;
   const b = decimalOdds - 1;
   const ev = winProb * b - lossProb;
-  if (ev <= 0) return 0;
+  if (!(ev > 0)) return 0;
   return clamp(ev / b, 0, 1);
+}
+
+/**
+ * Binary temperature scaling: sigma(gamma * logit(q)) = q^g / (q^g + (1-q)^g).
+ *
+ * This is the single calibration transform shared by the trainer
+ * (adaptiveController) and the serving path (predictionEngine). Keeping one
+ * implementation guarantees that a gamma chosen offline means exactly the same
+ * thing when it is applied to live probabilities. gamma > 1 sharpens, gamma < 1
+ * flattens toward 0.5; q = 0.5 is a fixed point and the transform is
+ * antisymmetric, so complementary outcomes always sum to 1.
+ */
+export function temperatureScaleBinary(q: number, gamma: number): number {
+  const p = clamp(Number.isFinite(q) ? q : 0.5, 0, 1);
+  if (!Number.isFinite(gamma) || gamma <= 0 || Math.abs(gamma - 1) < 1e-12) return p;
+  if (p <= 0) return 0;
+  if (p >= 1) return 1;
+  const a = Math.pow(p, gamma);
+  const b = Math.pow(1 - p, gamma);
+  return a / (a + b);
 }
